@@ -362,6 +362,25 @@ services:
     networks:
       - ongrid_net
 
+  ongrid-ollama:
+    image: docker.io/ollama/ollama:latest
+    container_name: ongrid-ollama
+    environment:
+      - OLLAMA_MODELS=/modelfiles
+    ports:
+      - 11434:11434
+    volumes:
+      - ollama_data:/root/.ollama
+      - /mnt/d/ai/ollama_models:/modelfiles  # Mount the directory with the trained mode
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
 # ---------------------------------------------------------------------------
 # ongrid-edge is intentionally NOT defined here — in real deployments the
 # edge agent runs on the user's own host, not on the cloud side. If you want
@@ -388,6 +407,7 @@ services:
 #      - ongrid_net
 
 volumes:
+  ollama_data:
   mysql_data:
   prometheus_data:
   grafana_data:
