@@ -10,9 +10,26 @@
 // (b) reverse-call handlers for register_edge / heartbeat /
 // push_host_metrics. Manager-initiated calls back to specific edges
 // (e.g. aiops tools) go through the same SDK via frontierbound.Client.Call.
+//
+// Command ongrid 是云端管理器二进制程序。它组合了 iam 与 manager
+// 两个限界上下文，对外暴露公共 HTTP API、Prometheus /metrics 端点，
+// 以及 manager 侧的服务端 SDK，该 SDK 用于拨号连接上游
+// github.com/singchia/frontier broker。
+//
+// Edge 隧道入口不在本进程终止：由上游 frontier 容器代为终止
+// geminio。manager 向该 frontier 建立一条长生命周期的服务端连接，
+// 并注册 (a) 用于 edge 握手的生命周期回调（GetEdgeID、EdgeOnline、
+// EdgeOffline）以及 (b) register_edge / heartbeat / push_host_metrics
+// 的反向调用 handler。manager 主动发起的针对特定 edge 的调用
+// （例如 aiops 工具）通过同一 SDK 经由 frontierbound.Client.Call 完成。
 package main
 
 import (
+	// Standard library packages: context, crypto, encoding, IO, net, OS,
+	// signal handling, filepath, sort, strings, sync, syscall and time
+	// utilities used across the binary.
+	// 标准库：context、crypto、encoding、IO、net、OS、信号处理、
+	// filepath、sort、strings、sync、syscall 与 time 等本程序各处通用的工具。
 	"context"
 	"crypto/hmac"
 	crand "crypto/rand"
@@ -34,12 +51,23 @@ import (
 	"syscall"
 	"time"
 
+	// Third-party libraries: eino LLM model abstraction, chi HTTP router,
+	// uuid generation, Prometheus client, and errgroup for goroutine
+	// error propagation.
+	// 第三方库：eino LLM 模型抽象、chi HTTP 路由、uuid 生成、
+	// Prometheus 客户端以及用于 goroutine 错误传递的 errgroup。
 	einomodel "github.com/cloudwego/eino/components/model"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/errgroup"
 
+	// internal/pkg (part 1): shared infrastructure packages — auth,
+	// authz middleware, config loading, DB helpers, error types, HTTP
+	// server, LLM client, logger, runner, secret box and workspace.
+	// internal/pkg（第一部分）：共享基础设施包——auth、authz 中间件、
+	// 配置加载、DB 辅助、错误类型、HTTP server、LLM 客户端、logger、
+	// runner、secret box 与 workspace。
 	"github.com/ongridio/ongrid/internal/pkg/auth"
 	"github.com/ongridio/ongrid/internal/pkg/authzmw"
 	"github.com/ongridio/ongrid/internal/pkg/config"
@@ -52,13 +80,25 @@ import (
 	"github.com/ongridio/ongrid/internal/pkg/secretbox"
 	"github.com/ongridio/ongrid/internal/pkg/workspace"
 
+	// Standard library (extra): JSON encoding and string-to-number parsing
+	// helpers pulled in alongside the pkg group above.
+	// 标准库（补充）：JSON 编解码与字符串数值解析辅助，与上面的 pkg 分组配套使用。
 	"encoding/json"
 	"strconv"
 
+	// internal/pkg (observability & vector store): embedding, qdrantx,
+	// tracing.
+	// internal/pkg（可观测性与向量存储）：embedding、qdrantx、tracing。
 	"github.com/ongridio/ongrid/internal/pkg/embedding"
 	"github.com/ongridio/ongrid/internal/pkg/qdrantx"
 	"github.com/ongridio/ongrid/internal/pkg/tracing"
 
+	// internal/pkg (query, notify & telemetry): logquery, notify, prom,
+	// promauth, promquery, promwrite, tracequery, plus the OpenTelemetry
+	// net/http instrumentation.
+	// internal/pkg（查询、通知与遥测）：logquery、notify、prom、
+	// promauth、promquery、promwrite、tracequery，以及 OpenTelemetry
+	// net/http 仪表化。
 	pkglogquery "github.com/ongridio/ongrid/internal/pkg/logquery"
 	"github.com/ongridio/ongrid/internal/pkg/notify"
 	"github.com/ongridio/ongrid/internal/pkg/prom"
@@ -68,6 +108,12 @@ import (
 	pkgtracequery "github.com/ongridio/ongrid/internal/pkg/tracequery"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
+	// internal/iam: identity & access management bounded context — biz
+	// (authz, membership, org, user), data stores (membership, org, user
+	// sqlite), model, server and service layers.
+	// internal/iam：身份与访问管理限界上下文——biz（authz、membership、
+	// org、user）、data 存储（membership、org、user sqlite）、model、
+	// server 与 service 各层。
 	iambizauthz "github.com/ongridio/ongrid/internal/iam/biz/authz"
 	iambizmembership "github.com/ongridio/ongrid/internal/iam/biz/membership"
 	iambizorg "github.com/ongridio/ongrid/internal/iam/biz/org"
@@ -93,6 +139,16 @@ import (
 	managertopologydata "github.com/ongridio/ongrid/internal/manager/data/topology/store"
 	managermodelalert "github.com/ongridio/ongrid/internal/manager/model/alert"
 
+	// internal/manager (part 2): aiops agent / chatruntime / graph /
+	// investigator / mentions / tools subpackages, plus biz & data for
+	// alert, approval, grafana, imbridge (with dingtalk/feishu/slack/
+	// telegram providers), knowledge, marketplace, mcp, monitor, secret,
+	// setting, skill and webshell, plus setting/webshell models.
+	// internal/manager（第二部分）：aiops 的 agent / chatruntime / graph /
+	// investigator / mentions / tools 子包，以及 alert、approval、
+	// grafana、imbridge（含 dingtalk/feishu/slack/telegram providers）、
+	// knowledge、marketplace、mcp、monitor、secret、setting、skill、
+	// webshell 的 biz 与 data，外加 setting/webshell model。
 	managerbizaiops "github.com/ongridio/ongrid/internal/manager/biz/aiops"
 	aiopsagent "github.com/ongridio/ongrid/internal/manager/biz/aiops/agent"
 	aiopschatruntime "github.com/ongridio/ongrid/internal/manager/biz/aiops/chatruntime"
@@ -132,12 +188,29 @@ import (
 	managerwebshelldata "github.com/ongridio/ongrid/internal/manager/data/webshell/store"
 	settingmodel "github.com/ongridio/ongrid/internal/manager/model/setting"
 	wsmodel "github.com/ongridio/ongrid/internal/manager/model/webshell"
+
+	// internal/manager (server part 1) & internal/pkg/mcpclient: HTTP
+	// handlers for imbridge, k8s, knowledge, webshell domains plus the
+	// shared MCP client.
+	// internal/manager（server 第一部分）与 internal/pkg/mcpclient：
+	// imbridge、k8s、knowledge、webshell 各域的 HTTP handler，以及共享 MCP 客户端。
 	managerserverimbridge "github.com/ongridio/ongrid/internal/manager/server/imbridge"
 	managerserverk8s "github.com/ongridio/ongrid/internal/manager/server/k8s"
 	managerserverknowledge "github.com/ongridio/ongrid/internal/manager/server/knowledge"
 	managerwebshellserver "github.com/ongridio/ongrid/internal/manager/server/webshell"
 	mcpclient "github.com/ongridio/ongrid/internal/pkg/mcpclient"
 
+	// internal/manager (part 3): biz & data for audit, flow, report;
+	// aiops model; and the bulk of HTTP server handlers (aiops, alert,
+	// approval, audit, device, edge, edgeauth, flow, integration, logs,
+	// marketplace, mcp, metric, middleware, monitor, prometheus, report,
+	// secret, setting, skill, systemhealth, systemupgrade, topology,
+	// traces).
+	// internal/manager（第三部分）：audit、flow、report 的 biz 与 data；
+	// aiops model；以及大部分 HTTP server handler（aiops、alert、
+	// approval、audit、device、edge、edgeauth、flow、integration、logs、
+	// marketplace、mcp、metric、middleware、monitor、prometheus、report、
+	// secret、setting、skill、systemhealth、systemupgrade、topology、traces）。
 	managerbizaudit "github.com/ongridio/ongrid/internal/manager/biz/audit"
 	managerbizflow "github.com/ongridio/ongrid/internal/manager/biz/flow"
 	managerbizreport "github.com/ongridio/ongrid/internal/manager/biz/report"
@@ -170,6 +243,12 @@ import (
 	managerservertopology "github.com/ongridio/ongrid/internal/manager/server/topology"
 	managerservertraces "github.com/ongridio/ongrid/internal/manager/server/traces"
 
+	// internal/manager/service: long-running service layers — aiops,
+	// aiopsconfig, alert, edge, frontierbound (upstream frontier SDK),
+	// k8s, metric, prometheus, systemhealth, systemupgrade.
+	// internal/manager/service：长期运行的服务层——aiops、aiopsconfig、
+	// alert、edge、frontierbound（上游 frontier SDK）、k8s、metric、
+	// prometheus、systemhealth、systemupgrade。
 	managersvcaiops "github.com/ongridio/ongrid/internal/manager/service/aiops"
 	manageraiopsconfig "github.com/ongridio/ongrid/internal/manager/service/aiopsconfig"
 	managersvcalert "github.com/ongridio/ongrid/internal/manager/service/alert"
@@ -184,11 +263,15 @@ import (
 	// Builtin skill init() blocks register Executors with the shared
 	// internal/skill registry. Both manager (metadata) and edge
 	// (dispatcher) need this import to populate the registry.
+	// 内置 skill 的 init() 块会向共享的 internal/skill registry 注册
+	// Executor。manager（元数据侧）与 edge（dispatcher 侧）都需要
+	// 该 import 以填充 registry。
 	skillcore "github.com/ongridio/ongrid/internal/skill"
 	skillbuiltin "github.com/ongridio/ongrid/internal/skill/builtin"
 )
 
 // version is overwritten at build time via -ldflags.
+// version 在构建时通过 -ldflags 覆写。
 var version = "dev"
 
 func main() {
@@ -211,6 +294,7 @@ func main() {
 	)
 
 	// Parent context cancelled on SIGINT/SIGTERM.
+	// 父 context 在收到 SIGINT/SIGTERM 时取消。
 	rootCtx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -402,6 +486,10 @@ func main() {
 	// Chat() call via a Resolver, with an internal TTL cache so the DB
 	// round-trip is cheap. Env-derived values seed the DB only if no row
 	// exists yet, so previous admin edits survive restarts.
+	// system_settings BC：管理员可编辑的运行时配置（目前为 LLM 凭据，后续会扩展）。
+	// LLM 客户端每次 Chat() 调用都通过 Resolver 查询该服务，内部带 TTL 缓存，
+	// 因此 DB 往返开销很低。环境变量派生值仅在尚无记录时写入 DB，
+	// 从而保证管理员之前的修改在重启后依然生效。
 	settingRepo := managersettingdata.NewRepo(db)
 	settingSvc := managerbizsetting.New(settingRepo, log.With(slog.String("comp", "setting")))
 	queryFallback := cfg.Prom.URL
@@ -414,6 +502,10 @@ func main() {
 	// so the auth middleware factory below can capture login attempts.
 	// Retention is 180 days by default; ONGRID_AUDIT_RETENTION_DAYS=0
 	// disables the sweep entirely (operator manages archival externally).
+	// HLD-010 审计日志——只追加的"谁做了什么"轨迹。提前构建，
+	// 以便下方的 auth 中间件工厂可以捕获登录尝试。
+	// 默认保留 180 天；ONGRID_AUDIT_RETENTION_DAYS=0 将完全禁用清理
+	//（由运维方自行在外部管理归档）。
 	auditRepo := manageraudtdata.New(db)
 	auditUC := managerbizaudit.New(auditRepo, log.With(slog.String("comp", "audit")))
 	auditRetentionDays := 180
@@ -433,6 +525,8 @@ func main() {
 	}
 	// Prom seeds. URLs are first-boot only — admin edits in UI persist;
 	// auth fields are blank by default (env can override at boot).
+	// Prometheus 种子数据。URL 仅在首次启动时写入——管理员的 UI 修改会持久保留；
+	// 认证字段默认为空（可通过环境变量在启动时覆盖）。
 	for _, seed := range []struct {
 		key       string
 		val       string
@@ -450,6 +544,9 @@ func main() {
 	// provided, startup creates an SA token automatically; otherwise the
 	// admin can paste one in the UI. SetIfAbsent honors prior admin edits
 	// across restarts.
+	// Grafana 种子数据。开箱即用时，manager 指向 docker 网络中的内嵌 Grafana。
+	// 若提供了引导管理员凭据，启动时会自动创建 SA token；否则管理员可以在 UI 中粘贴 token。
+	// SetIfAbsent 在重启间保留管理员之前的修改。
 	if err := settingSvc.SetIfAbsent(rootCtx, settingmodel.CategoryGrafana, settingmodel.KeyGrafanaRootURL, cfg.Grafana.InternalRootURL, false); err != nil {
 		log.Warn("seed grafana root_url", slog.Any("err", err))
 	}
@@ -457,6 +554,9 @@ func main() {
 	// only, admin edits in UI persist across restarts. The URL is the
 	// only field we seed; auth and TLS stay blank by default since the
 	// embedded loki/tempo containers don't authenticate.
+	// Loki / Tempo 种子数据。沿用 Prom 种子模式——仅在首次启动时写入，
+	// 管理员的 UI 修改在重启间保留。URL 是唯一写入的字段；
+	// 认证和 TLS 默认留空，因为内嵌的 loki/tempo 容器不做认证。
 	if err := settingSvc.SetIfAbsent(rootCtx, settingmodel.CategoryLoki, settingmodel.KeyLokiURL, cfg.Logs.URL, false); err != nil {
 		log.Warn("seed loki url", slog.Any("err", err))
 	}
@@ -466,6 +566,9 @@ func main() {
 	// WebSearch seeds. Default provider = SearXNG (zero-config baseline),
 	// pointing at the docker-internal http://searxng:8080. SetIfAbsent
 	// preserves any prior admin choice across restarts.
+	// WebSearch 种子数据。默认 provider 为 SearXNG（零配置基线），
+	// 指向 docker 内部地址 http://searxng:8080。
+	// SetIfAbsent 在重启间保留管理员之前的选择。
 	if err := settingSvc.SetIfAbsent(rootCtx, settingmodel.CategoryWebSearch, settingmodel.KeyWebSearchProvider, settingmodel.ProviderSearxng, false); err != nil {
 		log.Warn("seed websearch provider", slog.Any("err", err))
 	}
@@ -475,16 +578,24 @@ func main() {
 	// Resolvers used by PluginConfigUC and integration test endpoints.
 	// They route through settingSvc.Get (60s cache), so admin UI saves
 	// take effect on the edge's next reload (push or 60s safety-net poll).
+	// 这些 Resolver 供 PluginConfigUC 与集成测试端点使用。
+	// 它们通过 settingSvc.Get 路由（60s 缓存），因此管理员在 UI 的保存
+	// 会在 edge 下一次重载时生效（推送或 60s 兜底轮询）。
 	lokiResolver := managerbizsetting.NewLokiResolver(settingSvc, cfg.Logs.URL)
 	tempoResolver := managerbizsetting.NewTempoResolver(settingSvc, cfg.Traces.URL)
 	settingHandler := managerserversetting.NewHandler(settingSvc)
 
 	// Grafana integration biz layer (PR-2). Wraps the pkg/grafana HTTP
 	// client and reads creds from system_settings on every Test/Sync call.
+	// Grafana 集成业务层（PR-2）。封装 pkg/grafana HTTP 客户端，
+	// 每次 Test/Sync 调用都会从 system_settings 读取凭据。
 	grafanaSvc := managerbizgrafana.New(settingSvc, cfg.Grafana.TLSInsecure, log.With(slog.String("comp", "grafana")))
 	// Monitor-page mirror dashboard uid; ongrid → Grafana one-way sync of
 	// user-managed PromQL panels. Override via env when the operator wants
 	// to keep our managed dashboard out of an existing uid namespace.
+	// Monitor 页面镜像 dashboard 的 uid；ongrid → Grafana 单向同步
+	// 用户管理的 PromQL 面板。当运维希望将我们托管的 dashboard 与现有 uid 命名空间隔开时，
+	// 可通过环境变量覆盖。
 	if v := os.Getenv("ONGRID_GRAFANA_PANEL_DASHBOARD_UID"); v != "" {
 		grafanaSvc.SetPanelDashboardUID(v)
 	}
@@ -493,11 +604,17 @@ func main() {
 	// (monitor_panels) and asynchronously mirrors every change into the
 	// ongrid-monitor Grafana dashboard via grafanaSvc.SyncMonitorPanels.
 	// Sync failures don't block API 200 — see biz/monitor/service.go.
+	// Monitor BC：用户管理的 Monitor 页面面板。持久化到 MySQL
+	//（monitor_panels）并通过 grafanaSvc.SyncMonitorPanels 异步将每次修改镜像到
+	// ongrid-monitor Grafana dashboard。
+	// 同步失败不会阻塞 API 返回 200——详见 biz/monitor/service.go。
 	monitorRepo := managermonitordata.NewRepo(db)
 	monitorSvc := managerbizmonitor.New(monitorRepo, grafanaSvc, log.With(slog.String("comp", "monitor")))
 	monitorHandler := managerservermonitor.NewHandler(monitorSvc)
 	// promTester is wired below if cfg.Prom.Enabled — left nil for the
 	// disabled case so the integration handler can 503 cleanly.
+	// promTester 在下方 cfg.Prom.Enabled 为真时装配——禁用场景下保持 nil，
+	// 以便集成处理器能干净地返回 503。
 	var integrationHandler *managerserverintegration.Handler
 
 	// Embedded-Grafana SA bootstrap. Runs in a goroutine because:
@@ -523,6 +640,9 @@ func main() {
 			// dashboard so it has the core fleet panels even on a fresh
 			// install with no user-added panels — otherwise "open in
 			// Grafana" from the Monitor page hit an empty/absent dashboard.
+			// SA token 已经就绪，推送 ongrid-monitor dashboard，
+			// 让全新安装（无用户面板）也能拥有核心集群面板——否则在 Monitor 页面
+			// 点击"在 Grafana 中打开"会命中空/缺失的 dashboard。
 			syncCtx, syncCancel := context.WithTimeout(rootCtx, 30*time.Second)
 			defer syncCancel()
 			if err := monitorSvc.SyncNow(syncCtx); err != nil {
@@ -536,6 +656,9 @@ func main() {
 	// LLM client. Resolver lets admin edits to system_settings take effect
 	// on the next Chat call (cache TTL = 60s) without a manager restart.
 	// Empty resolver fields fall back to cfg.OpenAI.
+	// LLM 客户端。Resolver 使管理员对 system_settings 的修改在下次 Chat 调用时生效
+	//（缓存 TTL = 60s），无需重启 manager。
+	// 空的 resolver 字段会回退到 cfg.OpenAI。
 	llmResolver := newLLMResolver(settingSvc)
 	openaiClient := llm.NewWithResolver(
 		llm.Config{APIKey: cfg.OpenAI.APIKey, Model: cfg.OpenAI.Model, BaseURL: cfg.OpenAI.BaseURL},
@@ -551,6 +674,12 @@ func main() {
 	// the LLMSettingsResolver wired below, so /settings/llm edits
 	// propagate within ~60s. A provider with empty APIKey is silently
 	// dropped from the catalog so it never appears in the SPA selector.
+	// 多 provider 路由器（ChatInput 模型选择器）。OpenAI 子客户端使用
+	// resolver-aware 路径，使管理员修改持续生效；其他 provider
+	//（Anthropic / Zhipu / Gemini / DeepSeek / Kimi）在此处从 env 播种，
+	// 随后通过下方装配的 LLMSettingsResolver 读取实时值，
+	// 因此 /settings/llm 的修改在 ~60s 内传播。
+	// APIKey 为空的 provider 会被静默从目录中丢弃，从而不会出现在 SPA 选择器中。
 	providerCfgs := []llm.ProviderConfig{}
 	if cfg.OpenAI.APIKey != "" {
 		providerCfgs = append(providerCfgs, llm.ProviderConfig{
@@ -613,36 +742,49 @@ func main() {
 	// SetIfAbsent honours prior admin edits across restarts. Models lists
 	// are stored as JSON arrays (matches the on-the-wire contract used
 	// by the integration handler).
+	// 在首次启动时从 env 播种各 provider 的 LLM settings 行，让
+	// 设置 → 集成 → LLM 模型 页面开箱即有内容可展示。
+	// SetIfAbsent 在重启间保留管理员之前的修改。Models 列表以 JSON 数组存储
+	//（与集成处理器使用的线上协议一致）。
 	for _, seed := range []struct {
 		key       string
 		val       string
 		sensitive bool
 	}{
 		// Anthropic
+		// Anthropic
 		{settingmodel.KeyAnthropicAPIKey, cfg.LLM.Anthropic.APIKey, true},
 		{settingmodel.KeyAnthropicBaseURL, cfg.LLM.Anthropic.BaseURL, false},
 		{settingmodel.KeyAnthropicDefaultModel, cfg.LLM.Anthropic.Model, false},
 		// Zhipu
+		// 智谱
 		{settingmodel.KeyZhipuAPIKey, cfg.LLM.Zhipu.APIKey, true},
 		{settingmodel.KeyZhipuBaseURL, cfg.LLM.Zhipu.BaseURL, false},
 		{settingmodel.KeyZhipuDefaultModel, cfg.LLM.Zhipu.Model, false},
+		// Gemini
 		// Gemini
 		{settingmodel.KeyGeminiAPIKey, cfg.LLM.Gemini.APIKey, true},
 		{settingmodel.KeyGeminiBaseURL, cfg.LLM.Gemini.BaseURL, false},
 		{settingmodel.KeyGeminiDefaultModel, cfg.LLM.Gemini.Model, false},
 		// DeepSeek
+		// DeepSeek
 		{settingmodel.KeyDeepSeekAPIKey, cfg.LLM.DeepSeek.APIKey, true},
 		{settingmodel.KeyDeepSeekBaseURL, cfg.LLM.DeepSeek.BaseURL, false},
 		{settingmodel.KeyDeepSeekDefaultModel, cfg.LLM.DeepSeek.Model, false},
 		// Kimi (Moonshot)
+		// Kimi（Moonshot）
 		{settingmodel.KeyKimiAPIKey, cfg.LLM.Kimi.APIKey, true},
 		{settingmodel.KeyKimiBaseURL, cfg.LLM.Kimi.BaseURL, false},
 		{settingmodel.KeyKimiDefaultModel, cfg.LLM.Kimi.Model, false},
 		// OpenAI's _default_model expansion (the legacy
 		// openai_api_key / openai_model / openai_base_url rows are
 		// already seeded above).
+		// OpenAI 的 _default_model 扩展（传统的
+		// openai_api_key / openai_model / openai_base_url 行
+		// 已经在上方播种）。
 		{settingmodel.KeyOpenAIDefaultModel, firstNonEmpty(cfg.OpenAI.Model, "gpt-5.4"), false},
 		// Cluster-wide default provider hint.
+		// 集群范围默认 provider 提示。
 		{settingmodel.KeyLLMDefaultProvider, cfg.LLM.Default, false},
 	} {
 		if err := settingSvc.SetIfAbsent(rootCtx, settingmodel.CategoryLLM, seed.key, seed.val, seed.sensitive); err != nil {
@@ -677,6 +819,9 @@ func main() {
 	// same system_settings.llm.* rows the integration UI edits, so an
 	// admin save propagates to the chat surface within ~60s without a
 	// manager restart. Empty rows fall back to the env defaults below.
+	// 装配动态 provider 目录。resolver 读取的 system_settings.llm.* 行
+	// 与集成 UI 编辑的是同一份，因此管理员的保存在 ~60s 内传播到聊天界面，
+	// 无需重启 manager。空行回退到下方的 env 默认值。
 	llmEnvDefaults := map[string]managerbizsetting.EnvProviderDefaults{
 		settingmodel.LLMProviderOpenAI: {
 			Label:   "OpenAI",
@@ -728,9 +873,13 @@ func main() {
 	// per-request Provider override flows through; absent that, behaviour
 	// matches the legacy single-provider path (router falls back to
 	// openaiClient when no providers are configured).
+	// 所有下游 agent/investigator 装配都使用 router，使 per-request 的 Provider 覆盖
+	// 可以贯穿传递；若未覆盖，行为与传统的单 provider 路径一致
+	//（在未配置任何 provider 时，router 回退到 openaiClient）。
 	llmClient := llm.Client(llmRouter)
 
 	// manager/edge biz + service + server.
+	// manager/edge 的 biz + service + server 层。
 	edgeRepo := manageredgedata.NewRepo(db)
 	deviceRepo := managerdevicedata.NewRepo(db)
 	edgeDeviceRepo := managerdevicedata.NewEdgeDeviceRepo(db)
@@ -742,6 +891,10 @@ func main() {
 	// even though last_seen_at is hours old (frontier closed the session
 	// without us writing the column). Force them offline once at startup
 	// based on the same threshold the alert pipeline uses.
+	// 启动补齐：修复"陈旧 online"的 edge 行。manager 崩溃或任何
+	// 早于 PR(edge-status-fix) 的部署可能让 edge.status 仍为 "online"，
+	// 而 last_seen_at 已是数小时前（frontier 关闭会话但未写该列）。
+	// 在启动时按告警流水线使用的同一阈值，强制将它们置为 offline。
 	{
 		threshold := cfg.Alert.EdgeOfflineThreshold
 		if threshold <= 0 {
@@ -768,11 +921,24 @@ func main() {
 	// nothing will ever finish it, and IncidentDetail spins on "Spawning
 	// root-cause analysis worker…" forever. Fail them once at startup so the
 	// SPA shows a re-analyzable error instead of a dead spinner.
+	// 启动补齐：修复孤立的 investigation 报告。RCA worker 仅存活于本进程内，
+	// 因此前一个进程（崩溃或部署期间）遗留的 pending/running 报告就成了孤儿——
+	// 没有任何东西会完成它，IncidentDetail 会一直转在"Spawning root-cause analysis
+	// worker…"。在启动时将它们置为失败，让 SPA 显示可重新分析的错误，
+	// 而不是死掉的转圈。
 	if n, err := manageralertdata.NewInvestigationRepo(db).FailOrphaned(rootCtx, "interrupted by manager restart"); err != nil {
 		log.Warn("alert: orphaned-investigation backfill failed", slog.Any("err", err))
 	} else if n > 0 {
 		log.Info("alert: failed orphaned investigations on boot", slog.Int64("rows", n))
 	}
+	// edge & k8s wiring: authenticator, service, biz usecase, HTTP handler.
+	// k8sUC takes a k8sEdgeIdentityIssuer (wraps edgeSvc) so clusters can
+	// mint edge identities, and a remote-write resolver that flows the
+	// Prom creds configured in UI through to edge scrape configs.
+	// edge 与 k8s 装配：认证器、service、biz 用例、HTTP handler。
+	// k8sUC 接收一个 k8sEdgeIdentityIssuer（包装 edgeSvc），让集群可以为 edge
+	// 签发身份；同时接收一个 remote-write resolver，将 UI 中配置的 Prom 凭据
+	// 流转到 edge 的 scrape 配置。
 	edgeAuthn := managerbizedge.NewAccessKeyAuthenticator(edgeRepo, log)
 	edgeSvc := managersvcedge.New(edgeUC, nil, log)
 	k8sRepo := managerk8sdata.NewRepo(db)
@@ -798,6 +964,11 @@ func main() {
 	// (cloud → edge reload push) is back-filled after frontierbound is
 	// constructed below; until then SetEdge() etc. are no-ops on the wire
 	// (edge's 60s safety-net poll covers).
+	// 插件运行时配置存储。UC notifier（cloud → edge 重载推送）
+	// 在下方 frontierbound 构造完成后再回填；在那之前 SetEdge() 等方法
+	// 在网络上都是空操作（由 edge 的 60s 兜底轮询兜底）。
+	// Plugin config repo + endpoint resolver used by the UC below.
+	// 插件配置仓储 + UC 下文用到的端点解析器。
 	pluginConfigRepo := manageredgedata.NewPluginConfigRepo(db)
 	pluginEndpointResolver := pluginEndpointResolver{
 		publicURL: cfg.PublicURL,
@@ -807,13 +978,21 @@ func main() {
 	k8sUC.SetTelemetryTargetResolver(pluginEndpointResolver)
 	pluginConfigUC := managerbizedge.NewPluginConfigUC(pluginConfigRepo, nil, pluginEndpointResolver, log)
 
+	// Edge HTTP handler — serves /v1/edges/* admin + tunnel endpoints.
+	// Edge HTTP handler —— 提供 /v1/edges/* 管理 + 隧道端点。
 	edgeHandler := managerserveredge.NewHandler(edgeSvc, deviceRepo, pluginConfigUC)
 	edgeHandler.SetAuthz(authzMW)
 	// edge upgrade bundles: dir is baked by docker build,
 	// publicURL from runtime config so edges across the internet can
 	// pull. Resolver is optional in degraded boots (image w/o bundle);
 	// the upgrade-package handler returns 503 when nil.
+	// edge 升级包：目录由 docker build 烘焙，
+	// publicURL 取自运行时配置，便于跨公网的 edge 拉取。
+	// Resolver 在降级启动（镜像无 bundle）时可选；
+	// 为 nil 时升级包 handler 返回 503。
 	edgeBundleDir := os.Getenv("ONGRID_EDGE_BUNDLE_DIR")
+	// Default bundle directory when env var not set.
+	// 未设置环境变量时的默认 bundle 目录。
 	if edgeBundleDir == "" {
 		edgeBundleDir = "/usr/share/ongrid/edge-bundles"
 	}
@@ -823,12 +1002,17 @@ func main() {
 		log.Warn("edge bundle dir missing; package upgrade endpoint will 503",
 			slog.String("dir", edgeBundleDir), slog.Any("err", err))
 	}
+	// Device HTTP handler — serves /v1/devices/* admin routes.
+	// Device HTTP handler —— 提供 /v1/devices/* 管理路由。
 	deviceHandler := managerserverdevice.NewHandler(deviceUC)
 
 	// topology layer: nodes / relations / relation types. PR-1
 	// stands up CRUD + 6 built-in relation type seeds; later PRs hook
 	// AIOps tools onto the same UC. Wired here so /v1/topology/* routes
 	// can be Register-ed alongside other admin-gated handlers below.
+	// 拓扑层：节点 / 关系 / 关系类型。PR-1 搭建 CRUD + 6 个内置关系类型种子；
+	// 后续 PR 把 AIOps 工具挂到同一个 UC 上。在此处装配，便于
+	// /v1/topology/* 路由与下方其他 admin-gated handler 一起 Register。
 	topologyNodeRepo := managertopologydata.NewNodeRepo(db)
 	topologyRelationRepo := managertopologydata.NewRelationRepo(db)
 	topologyRelationTypeRepo := managertopologydata.NewRelationTypeRepo(db)
@@ -843,18 +1027,29 @@ func main() {
 	// device row + writes device.node_id. Existing devices were already
 	// backfilled by topology.Migrate above; this hook covers ongoing
 	// registers + any device that landed between migration and now.
+	// device → topology 镜像。把拓扑 UC 注入 edge UC，
+	// 使注册流程在每条新 device 旁边落一条 `nodes` 行 + 写 device.node_id。
+	// 历史 device 已由上方 topology.Migrate 回填；此 hook 覆盖
+	// 迁移之后的新增注册 + 迁移与启动之间落地的设备。
 	edgeUC.SetNodeMirror(topologyUC)
 	deviceUC.SetTopologyMirror(topologyUC)
+	// Reconcile deleted-topology rows on boot — clears stale node entries
+	// whose devices were removed before the mirror hook existed.
+	// 启动时对账已删除拓扑行 —— 清理在 mirror hook 存在前被删除的陈旧节点。
 	if n, err := deviceUC.ReconcileDeletedTopology(rootCtx); err != nil {
 		log.Warn("device: deleted topology reconcile on boot failed", slog.Any("err", err))
 	} else if n > 0 {
 		log.Info("device: deleted topology reconcile on boot completed", slog.Int("count", n))
 	}
+	// Reconcile orphan devices — devices without a node row get re-mirrored.
+	// 对账孤儿设备 —— 没有 node 行的 device 重新镜像。
 	if n, err := deviceUC.ReconcileOrphanDevices(rootCtx); err != nil {
 		log.Warn("device: orphan reconcile on boot failed", slog.Any("err", err))
 	} else if n > 0 {
 		log.Info("device: orphan reconcile on boot completed", slog.Int("count", n))
 	}
+	// K8s also mirrors into topology: clusters → topology nodes.
+	// K8s 同样镜像到拓扑：cluster → 拓扑节点。
 	k8sUC.SetTopologyMirror(topologyUC)
 	if err := k8sUC.ReconcileTopology(rootCtx); err != nil {
 		log.Warn("k8s: topology reconcile on boot failed", slog.Any("err", err))
@@ -864,6 +1059,9 @@ func main() {
 	// endpoint for Loki/Tempo and exact scope endpoints for controller config
 	// and Prometheus remote_write. Telemetry credentials never enter the
 	// tunnel authenticator.
+	// 数据面鉴权校验 —— nginx auth_request 调用兼容端点（Loki/Tempo）
+	// 以及精确 scope 端点（controller config / Prometheus remote_write）。
+	// 遥测凭据不进入隧道鉴权器。
 	dataPlaneAuthHandler := managerserveredgeauth.NewHandler(
 		dataPlaneAuthAdapter{edge: edgeAuthn, telemetry: telemetryAuthn},
 		log,
@@ -877,25 +1075,37 @@ func main() {
 	// are evaluated by the Prom-backed PipelineEvaluator on its 30s ticker.
 	// No MySQL writes happen and no /v1/edges/{id}/metrics MySQL handler
 	// is registered. The Prom-backed handler below replaces it.
+	// PR-F：MySQL 快速路径已注释掉 —— 唯一真源已切到云端 Prometheus。
+	// Edge 仍发送 push_host_metrics 以保持向后兼容（NoopHostMetricIngester 丢弃批次）；
+	// host-metric 告警由 Prom 支撑的 PipelineEvaluator 在其 30s ticker 上评估。
+	// 不再产生 MySQL 写入，也不再注册 /v1/edges/{id}/metrics 的 MySQL handler。
+	// 下方的 Prom 支撑 handler 取而代之。
 	//
 	// metricWriter := managermetricdata.NewBizWriter(db)
 	// metricReader := managermetricdata.NewBizReader(db)
 	// metricIngester := managerbizmetric.NewIngester(metricWriter, reg, log)
 	_ = managermetricdata.NewBizReader // keep imports alive while file is in tree
-	_ = managerbizmetric.NewIngester
+	_ = managerbizmetric.NewIngester   // 文件保留期间维持 import 存活
 
 	// Alert subdomain — incident lifecycle, silence consumption, delivery
 	// persistence. The host metric decorator below feeds the
 	// firing path; the pipeline evaluator (started below) layers in
 	// pipeline-health rules on the same usecase.
+	// 告警子域 —— 事件生命周期、静默消费、投递持久化。
+	// 下方 host metric decorator 喂给 firing 路径；
+	// pipeline evaluator（下方启动）在同一 usecase 上叠加 pipeline-health 规则。
 	alertRepo := manageralertdata.NewRepo(db)
 	alertUC := managerbizalert.NewUsecase(alertRepo, log.With(slog.String("comp", "alert")))
+	// Seed built-in notification channels + alert rules from config on boot.
+	// 启动时从配置播种内置通知渠道 + 告警规则。
 	if err := manageralertdata.SeedChannelsFromConfig(rootCtx, alertRepo, cfg.Notification); err != nil {
 		log.Warn("seed notification channels", slog.Any("err", err))
 	}
 	if err := manageralertdata.SeedBuiltinRules(rootCtx, alertRepo, cfg.Alert); err != nil {
 		log.Warn("seed builtin alert rules", slog.Any("err", err))
 	}
+	// Cached rules provider refreshes from DB on evaluator interval.
+	// 缓存式 rules provider 按 evaluator interval 从 DB 刷新。
 	alertRules := managerbizalert.NewCachedRulesProvider(
 		alertRepo,
 		cfg.Alert.EvaluatorInterval,
@@ -907,12 +1117,17 @@ func main() {
 	alertResolver := managerbizalert.NewDBChannelResolver(alertRepo, cfg.Notification.DefaultChannels)
 	// Honour rule-level notify_channel_ids overrides — resolver looks
 	// the rule up by key and reads its NotifyChannelIDsJSON.
+	// 尊重 rule 级 notify_channel_ids 覆盖 —— resolver 按 key 查规则，
+	// 读取其 NotifyChannelIDsJSON。
 	alertResolver.SetRuleLookup(alertRepo.GetRuleByKey)
 	alertInhibitor := managerbizalert.NewBuiltinInhibitor(alertRepo)
 	// Lifecycle alerting path was removed in — every
 	// "edge offline" alert is now a metric_raw rule on the
 	// edge_last_seen_seconds_ago gauge that PipelineEvaluator refreshes
 	// every tick. Detection delay = 1× evaluator interval (default 30s).
+	// Lifecycle 告警路径已移除 —— 每个 "edge offline" 告警
+	// 现在都是 metric_raw 规则，挂在 edge_last_seen_seconds_ago gauge 上，
+	// PipelineEvaluator 每 tick 刷新。检测延迟 = 1× evaluator interval（默认 30s）。
 
 	//-final collapse: HostMetricDecorator is gone. Every
 	// host-metric threshold alert is a metric_raw rule the
@@ -921,17 +1136,24 @@ func main() {
 	// agents) but we no longer evaluate alerts inline; the no-op
 	// ingester just accepts the batch so edges back off cleanly.
 	// New edges write directly to Prom via push_prom_samples.
+	//-最终坍缩：HostMetricDecorator 已移除。每条 host-metric 阈值告警
+	// 都是 metric_raw 规则，PipelineEvaluator 在其 30s ticker 上对 Prom 运行。
+	// push_host_metrics 隧道 handler 仍装配（兼容旧版 edge agent），
+	// 但不再在线评估告警；no-op ingester 仅接收批次让 edge 干净退避。
+	// 新版 edge 直接通过 push_prom_samples 写入 Prom。
 	metricIngestSvc := managerbizalert.NewNoopHostMetricIngester()
 	// PR-F: legacy MySQL-backed metric service + handler removed from the
 	// router. Replacement registered after promQueryClient is constructed.
 	// metricQuery := managerbizmetric.NewQueryUsecase(metricReader, log)
 	// metricSvc := managersvcmetric.New(metricIngester, metricQuery, log)
 	// metricHandler := managerservermetric.NewHandler(metricSvc)
-	_ = managersvcmetric.New
+	_ = managersvcmetric.New // keep import alive while file is in tree / 文件保留期间维持 import
 
 	// Cloud-side Prometheus. When disabled, all three handles
 	// stay nil; downstream wiring is nil-safe (push_prom_samples silently
 	// drops, query_promql tool is not registered).
+	// 云端 Prometheus。未启用时三个句柄全部为 nil；
+	// 下游装配 nil-safe（push_prom_samples 静默丢弃，query_promql 工具不注册）。
 	var (
 		promwriteClient   *pkgpromwrite.Client
 		promQueryClient   *pkgpromquery.Client
@@ -945,6 +1167,12 @@ func main() {
 		// when the DB rows are absent. UI saves take effect within ~5s
 		// without a manager restart — the prom clients re-resolve on each
 		// request and the round-tripper has its own 5s cache.
+		// 一个 resolver 三种角色：实现 promauth.Resolver（鉴权）、
+		// promwrite.EndpointResolver（写 URL）、promquery.BaseURLResolver（查询 URL）。
+		// 三者每次调用都从 system_settings.{prom} 读取；DB 行缺失时
+		// 用 cfg.Prom 中由 env 推导的 URL 作为兜底。UI 保存约 5s 内生效，
+		// 无需重启 manager —— prom 客户端每次请求重新解析，
+		// round-tripper 自身也有 5s 缓存。
 		promHTTPClient, herr := promauth.BuildClient(
 			promauth.TLSConfig{
 				Insecure: cfg.Prom.TLSInsecure,
@@ -970,11 +1198,16 @@ func main() {
 			slog.String("note", "URLs hot-reload from system_settings within ~5s; TLS still requires restart"),
 		)
 	} else {
+		// Prom disabled — surface one warning so the operator knows which
+		// downstream features degrade.
+		// Prom 未启用 —— 打一条 warning 让运维知道哪些下游特性降级。
 		log.Warn("prom disabled — push_prom_samples will be silently dropped, query_promql tool not registered, /v1/edges/{id}/metrics returns 501")
 	}
 
 	// Build the integration handler now that we know whether prom is wired.
 	// promTester is nil when disabled; the handler 503s cleanly in that case.
+	// 现在已知 Prom 是否装配，构造 integration handler。
+	// 未启用时 promTester 为 nil；handler 在该情况下干净返回 503。
 	var promTester managerserverintegration.PromQuerier
 	if promQueryClient != nil {
 		promTester = managerserverintegration.AdaptPromQuerier(func(ctx context.Context, expr string, ts time.Time) error {
@@ -984,10 +1217,14 @@ func main() {
 	}
 	// Loki / Tempo URL probes — back the Integrations "测试连接" buttons.
 	// They both hit GET <url>/ready with optional basic auth + TLS-skip.
+	// Loki / Tempo URL 探针 —— 支撑 Integrations "测试连接" 按钮。
+	// 二者都请求 GET <url>/ready，可选 basic auth + TLS-skip。
 	lokiProbe := managerbizsetting.NewLokiURLProbe(lokiResolver)
 	tempoProbe := managerbizsetting.NewTempoURLProbe(tempoResolver)
 	// Web search probe — same WebSearchResolver the skill uses, so a
 	// passing probe means the skill itself will work.
+	// Web 搜索探针 —— 与 skill 使用的 WebSearchResolver 相同，
+	// 探针通过意味着 skill 本身也能工作。
 	webSearchProbe := managerbizsetting.NewWebSearchProbe(managerbizsetting.NewWebSearchResolver(settingSvc))
 	integrationHandler = managerserverintegration.NewHandler(grafanaSvc, promTester, lokiProbe, tempoProbe, webSearchProbe)
 	integrationHandler.SetLLMRouter(llmRouter)
@@ -996,6 +1233,8 @@ func main() {
 	// Prom-backed metric read handler (PR-F replacement for the MySQL
 	// fast path). When prom is disabled the handler still installs but
 	// returns 501 so the UI can degrade gracefully.
+	// Prom 支撑的 metric 读 handler（PR-F 替换 MySQL 快速路径）。
+	// Prom 未启用时 handler 仍装配但返回 501，让 UI 优雅降级。
 	var metricPromQuerier managerservermetric.PromQuerier
 	if promQueryClient != nil {
 		metricPromQuerier = promQueryClient
@@ -1007,6 +1246,10 @@ func main() {
 	// data plane /loki/api/v1/push route stays auth_request-gated for
 	// ingest only — for the data-plane-vs-control-plane
 	// separation.
+	// Loki 查询代理。使产品内 Logs 页面可运行 LogQL，
+	// 而无需把 /loki/* 读路径暴露给 nginx。数据面 /loki/api/v1/push
+	// 路由仍由 auth_request 鉴权，仅用于 ingest ——
+	// 出于数据面与控制面分离的考虑。
 	var logsHandler *managerserverlogs.Handler
 	if cfg.Logs.URL != "" {
 		logsHandler = managerserverlogs.NewHandler(
@@ -1014,6 +1257,7 @@ func main() {
 		)
 	} else {
 		// Loki disabled — handler installs but every route returns 503.
+		// Loki 未启用 —— handler 仍装配但每条路由返回 503。
 		logsHandler = managerserverlogs.NewHandler(nil)
 	}
 
@@ -1022,6 +1266,10 @@ func main() {
 	// facet searches without exposing Tempo's /api/* read paths through
 	// nginx. The data plane /v1/traces ingest route stays auth_request-
 	// gated for OTLP push only —
+	// Tempo 查询代理。镜像上方 Loki 块 —— 对 trace 信号起相同作用。
+	// 使产品内 Traces 页面可运行 TraceQL / facet 检索，
+	// 而无需把 Tempo 的 /api/* 读路径暴露给 nginx。数据面 /v1/traces
+	// ingest 路由仍由 auth_request 鉴权，仅用于 OTLP push ——
 	var tracesHandler *managerservertraces.Handler
 	if cfg.Traces.URL != "" {
 		tracesHandler = managerservertraces.NewHandler(
@@ -1029,6 +1277,7 @@ func main() {
 		)
 	} else {
 		// Tempo disabled — handler installs but every route returns 503.
+		// Tempo 未启用 —— handler 仍装配但每条路由返回 503。
 		tracesHandler = managerservertraces.NewHandler(nil)
 	}
 
@@ -1036,6 +1285,9 @@ func main() {
 	// to the upstream frontier broker (a separate docker container) and
 	// installs lifecycle callbacks + reverse-call handlers. aiops tools
 	// reuse fbClient.Call to dispatch back to specific edges.
+	// Frontierbound 服务端 SDK：与上游 frontier broker（独立 docker 容器）
+	// 建立长生命周期服务连接，并安装生命周期回调 + 反向调用 handler。
+	// aiops 工具复用 fbClient.Call 向特定 edge 派发调用。
 	//
 	// ONGRID_FRONTIER_DISABLED=true bypasses the dial entirely — the
 	// resulting Client errors all Call/OpenStream/NotifyX with
@@ -1043,6 +1295,11 @@ func main() {
 	// e2e harness so manager can come up without a real broker. The HTTP
 	// surface and DB stack are unaffected; edge-tunnel-only features
 	// (webssh, edge reverse calls) surface ErrDisabled at the call site.
+	// ONGRID_FRONTIER_DISABLED=true 完全跳过拨号 —— 得到的 Client
+	// 对所有 Call/OpenStream/NotifyX 返回 frontierbound.ErrDisabled，
+	// 对 Register 是 no-op。供 e2e 测试框架使用，使 manager 可在
+	// 无真实 broker 的情况下启动。HTTP 接口与 DB 栈不受影响；
+	// 仅 edge-tunnel 特性（webssh、edge 反向调用）在调用点报 ErrDisabled。
 	var fbClient *managersvcfb.Client
 	if cfg.FrontierClient.Disabled {
 		log.Warn("frontierbound: disabled (ONGRID_FRONTIER_DISABLED=true) — edge-tunnel features will error at call site")
@@ -1066,11 +1323,16 @@ func main() {
 	// Back-fill the edge service's tunnel dispatcher now that fbClient
 	// exists. Until this point UpgradeAgent surfaced a "not wired" error
 	// — by design, because we don't accept HTTP traffic until later.
+	// 现在 fbClient 已就绪，回填 edge service 的隧道派发器。
+	// 此前 UpgradeAgent 会报 "not wired" 错误 —— 故意为之，
+	// 因为我们直到更晚才接收 HTTP 流量。
 	edgeSvc.SetEdgeCaller(fbClient)
 
 	// promIngester for the Wiring is typed as the interface; passing a
 	// typed-nil *Ingester would be a non-nil interface, so explicitly hand
 	// the handler a true nil when Prom is disabled.
+	// Wiring 中的 promIngester 是接口类型；传入 typed-nil *Ingester
+	// 会得到非 nil 接口，从而绕过条件注册。Prom 未启用时显式传 nil。
 	var promWiring managersvcfb.PromwriteIngester
 	if promwriteIngester != nil {
 		promWiring = promwriteIngester
@@ -1079,6 +1341,9 @@ func main() {
 	// WebSSH plumbing — built before frontierbound.Install so the
 	// shell_output / shell_exit edge-to-manager handlers can route
 	// pushes through the live router.
+	// WebSSH 管道 —— 在 frontierbound.Install 之前构建，使
+	// shell_output / shell_exit edge→manager handler 可通过
+	// 实时 router 路由推送。
 	webshellRouter := managerwebshellbiz.NewRouter()
 	webshellAuditRepo := managerwebshelldata.NewRepo(db)
 
@@ -1092,6 +1357,8 @@ func main() {
 		// DeviceResolver wires the post-split edge_id → device_id
 		// resolution path (push pipeline). The biz junction repo is the
 		// source of truth.
+		// DeviceResolver 装配拆分后的 edge_id → device_id 解析路径
+		// （push pipeline）。biz junction 仓储为唯一真源。
 		DeviceResolver: edgeDeviceRepo,
 		K8sRegistry:    k8sSvc,
 		K8sInventory:   k8sSvc,
@@ -1104,12 +1371,18 @@ func main() {
 	// PluginConfigUC was constructed with notifier=nil because frontierbound
 	// hadn't been built yet. From here on, mutating plugin config kicks a
 	// real-time push to the affected edge.
+	// 现在 fbClient 已存活，回填重载 notifier —— 此前 PluginConfigUC
+	// 构造时 notifier=nil，因为 frontierbound 尚未构建。从此处起，
+	// 修改插件配置会触发对受影响 edge 的实时推送。
 	pluginConfigUC.SetNotifier(fbClient)
 	pluginConfigUC.SetDatabaseMetricsSecretWriter(fbClient)
 
 	// WebSSH HTTP handler — uses fbClient.OpenStream to layer ssh +
 	// pty over a raw byte stream into edge:127.0.0.1:22. SSH client
 	// runs in the manager; edge is a dumb byte forwarder.
+	// WebSSH HTTP handler —— 通过 fbClient.OpenStream 把 ssh + pty
+	// 叠加在原始字节流上，直达 edge:127.0.0.1:22。SSH 客户端运行在
+	// manager；edge 仅做字节转发。
 	webshellHandler := managerwebshellserver.NewHandler(
 		webshellStreamerAdapter{c: fbClient},
 		webshellRouter,
@@ -1120,11 +1393,16 @@ func main() {
 	)
 	webshellHandler.SetAuthz(authzMW)
 
+	// Alert service ties alert UC + repo + notify router together.
+	// Alert service 把 alert UC + repo + notify router 串联起来。
 	alertSvc := managersvcalert.New(alertUC, alertRepo, notifyRouter, log.With(slog.String("comp", "alert-svc")))
 	// Wire the read-only preview clients (Prom range + Loki range). Each
 	// is optional — when nil, the corresponding kind returns skipped_reason
 	// instead of a hard error. Built before the AIOps runtime so
 	// conversational draft tools can reuse the same service path.
+	// 装配只读预览客户端（Prom range + Loki range）。二者皆可选 ——
+	// 为 nil 时对应 kind 返回 skipped_reason 而非硬错误。
+	// 在 AIOps runtime 之前构建，使会话草稿工具可复用同一服务路径。
 	{
 		previewDeps := managerbizalert.PreviewDeps{}
 		if promQueryClient != nil {
@@ -1139,6 +1417,8 @@ func main() {
 	// IM bridge admin repo/UC is needed by Settings -> Channels HTTP handlers.
 	// The runtime-facing Bridge service still wires later, after aiopsSvc
 	// exists.
+	// IM bridge admin repo/UC 供 Settings -> Channels HTTP handler 使用。
+	// 面向 runtime 的 Bridge service 在 aiopsSvc 存在之后才装配。
 	if err := managerimbridgedata.Migrate(db); err != nil {
 		log.Error("imbridge: migrate failed", slog.Any("err", err))
 	}
@@ -1146,16 +1426,23 @@ func main() {
 	imbridgeUC := managerbizimbridge.NewUC(imbridgeRepo)
 
 	// manager/aiops biz + service + server.
+	// manager/aiops 业务层 + service + server。
 	//
 	// BudgetChecker wiring: cfg.LLM.DailyTokenLimit (ONGRID_LLM_DAILY_TOKEN_LIMIT,
 	// default 0=unlimited) drives an llm.InMemoryBudget that the graph-layer
 	// callback chain checks before each ChatModel turn — see Phase 4 cbDeps
 	// build below where the checker is set when the limit > 0.
+	// BudgetChecker 装配：cfg.LLM.DailyTokenLimit（ONGRID_LLM_DAILY_TOKEN_LIMIT，
+	// 默认 0=不限）驱动一个 llm.InMemoryBudget，graph 层回调链在每次
+	// ChatModel turn 之前检查它 —— 见下方 Phase 4 cbDeps 构建，
+	// limit > 0 时才设置 checker。
 	aiopsRepo := manageraiopsdata.NewBizRepo(db)
 	mutatingProposalRepo := manageraiopsdata.NewMutatingProposalRepo(db)
 	// PromQuerier is the interface tools/registry takes; passing a typed-nil
 	// *Client would yield a non-nil interface and bypass the conditional
 	// tool registration. Explicitly hand it nil when Prom is disabled.
+	// PromQuerier 是 tools/registry 接收的接口；传入 typed-nil *Client
+	// 会得到非 nil 接口，绕过条件工具注册。Prom 未启用时显式传 nil。
 	var promQuerier aiopstools.PromQuerier
 	if promQueryClient != nil {
 		promQuerier = promQueryClient
@@ -1163,6 +1450,8 @@ func main() {
 	// LogQuerier / TraceQuerier mirror the same pattern: build a client
 	// only when the URL is configured so the corresponding query_logql /
 	// query_traceql tools register conditionally.
+	// LogQuerier / TraceQuerier 镜像相同模式：仅当 URL 已配置时才
+	// 构建客户端，使对应的 query_logql / query_traceql 工具条件注册。
 	var logQuerier aiopstools.LogQuerier
 	if cfg.Logs.URL != "" {
 		logQuerier = pkglogquery.New(cfg.Logs.URL, log.With(slog.String("comp", "aiops-logquery")))
@@ -1177,10 +1466,14 @@ func main() {
 	toolsReg.SetK8sSnapshotReader(k8sSvc)
 	// query_change_events (HLD-013 Phase 2) — RCA "what changed near T".
 	// *audit.Usecase satisfies aiopstools.AuditLister via ListChanges.
+	// query_change_events（HLD-013 Phase 2）—— RCA "T 时刻附近发生了什么变化"。
+	// *audit.Usecase 通过 ListChanges 实现 aiopstools.AuditLister。
 	toolsReg.SetAuditLister(auditUC)
 	// Populate deployment-level facts for the get_topology tool. Channel
 	// counter pulls from the alert repo's enabled-channel listing so the
 	// number reflects what notify_router actually fans out to.
+	// 为 get_topology 工具填充部署级事实。Channel counter 从 alert repo
+	// 的启用渠道列表拉取，使数字反映 notify_router 实际扇出的渠道数。
 	toolsReg.SetTopologyInfo(aiopstools.TopologyInfo{
 		ManagerVersion:     version,
 		ConfiguredPromURL:  cfg.Prom.QueryURL,
@@ -1197,6 +1490,9 @@ func main() {
 	// Wire the topology graph usecase so expand_topology /
 	// find_topology_node show up in the BaseTool roster. nil-safe — the
 	// two BaseTools are gated on this exact field.
+	// 装配拓扑图 usecase，使 expand_topology /
+	// find_topology_node 出现在 BaseTool 清单中。nil 安全 ——
+	// 这两个 BaseTool 都以此字段是否非空作为开启条件。
 	toolsReg.SetTopologyGraph(topologyUC)
 	aiopsAgent := aiopsagent.New(
 		llmClient,
@@ -1219,12 +1515,27 @@ func main() {
 	//     (silent on missing dirs — fresh installs boot fine).
 	//   - chatruntime.Runtime, the cutover entry the service routes to.
 	// Mismatch / build errors fall back to legacy with a logged warning.
+	// PR-9 引入可选的新 graph-based agent 内核。默认
+	// 仍为 "legacy"，保证开箱即用的对话行为不变；
+	// 运维方通过 ONGRID_AGENT_KERNEL=graph 显式启用新路径。
+	// 当环境变量被设置时，构建：
+	//   - RoutingChatModel（PR-1）包装现有 llmRouter，每个
+	//     provider id（"openai" | "anthropic" | "zhipu" | "gemini"）一份。
+	//   - 通过 Registry.BuildBaseTools + AppendHostFilesTools
+	//     得到装饰后的 BaseTool 切片，再用标准链 Wrap 起来。
+	//   - 来自 ./skills + ./agents 的 SkillRegistry / AgentRegistry
+	//     （目录缺失时静默忽略 —— 全新安装也能正常启动）。
+	//   - chatruntime.Runtime，即服务路由切换到的入口。
+	// 不匹配 / 构建错误会回退到 legacy，并记录一条 warning 日志。
 	kernel := managersvcaiops.ParseKernel(os.Getenv("ONGRID_AGENT_KERNEL"))
 	log.Info("aiops agent kernel selected", slog.String("kernel", string(kernel)))
 
 	// Knowledge base + git-repo integration (RAG Phase-1). Wire BEFORE
 	// buildAIOpsRuntime so the BaseTool bag picks up query_knowledge —
 	// SetKnowledgeSearcher only affects subsequent BuildBaseTools calls.
+	// 知识库 + git-repo 集成（RAG Phase-1）。必须在
+	// buildAIOpsRuntime 之前装配，这样 BaseTool 集合才会带上 query_knowledge ——
+	// SetKnowledgeSearcher 只影响其后的 BuildBaseTools 调用。
 	if err := managerknowledgedata.Migrate(db); err != nil {
 		log.Error("knowledge: migrate failed", slog.Any("err", err))
 	}
@@ -1233,6 +1544,9 @@ func main() {
 	// (works for OpenAI, GLM, Qwen, DeepSeek). Falls back to the
 	// existing OPENAI_API_KEY when ONGRID_EMBEDDING_API_KEY is empty
 	// (most operators just have one provider configured).
+	// Embedding 提供方 —— 默认走 OpenAI 兼容 API
+	// （OpenAI / GLM / Qwen / DeepSeek 均可）。当 ONGRID_EMBEDDING_API_KEY
+	// 为空时回退到现有 OPENAI_API_KEY（大多数运维方只配了一个 provider）。
 	embAPIKey := os.Getenv("ONGRID_EMBEDDING_API_KEY")
 	if embAPIKey == "" {
 		embAPIKey = cfg.OpenAI.APIKey
@@ -1241,12 +1555,22 @@ func main() {
 	if embBaseURL == "" {
 		embBaseURL = cfg.OpenAI.BaseURL
 	}
+	// Embedding vector dimension — defaults to OpenAI's 1536 (text-embedding-3-small).
+	// Operators override via ONGRID_EMBEDDING_DIM when using a different model
+	// (e.g. 768 for BGE-small, 1024 for GLM).
+	// Embedding 向量维度 —— 默认 OpenAI 的 1536（text-embedding-3-small）。
+	// 使用其他模型时运维方通过 ONGRID_EMBEDDING_DIM 覆盖
+	// （例如 BGE-small 用 768，GLM 用 1024）。
 	embDim := 1536
 	if v := os.Getenv("ONGRID_EMBEDDING_DIM"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			embDim = n
 		}
 	}
+	// Construct the embedder; embErr is captured (not fatal) so the knowledge
+	// usecase can still serve read paths when embedding is unconfigured.
+	// 构造 embedder；embErr 被捕获（非致命），这样在未配置 embedding 时
+	// 知识库 usecase 仍能提供读路径。
 	embedder, embErr := embedding.New(embedding.Config{
 		Provider: os.Getenv("ONGRID_EMBEDDING_PROVIDER"),
 		Model:    os.Getenv("ONGRID_EMBEDDING_MODEL"),
@@ -1269,6 +1593,13 @@ func main() {
 		// fresh install instead of 404'ing. Operator configures
 		// ONGRID_EMBEDDING_API_KEY later → writes unblock without
 		// restart-of-stack (only the manager needs the key on boot).
+		// 当未配置 embedder 时以 nil 构造 —— usecase
+		// 暴露读路径（ListDocs/Repos/GetDoc/ListPaths），
+		// 写路径（CreateManualDoc/Sync/Search）以
+		// embed != nil 作为门控，这样 SPA 的 知识库 / 代码仓库 页面
+		// 在全新安装时也能渲染而不是 404。运维方后续配置
+		// ONGRID_EMBEDDING_API_KEY → 无需重启整栈即可解锁写路径
+		// （只有 manager 启动时需要这个 key）。
 		var maybeEmbedder embedding.Embedder
 		if embErr != nil {
 			log.Warn("knowledge: embedder unavailable — reads enabled, writes disabled",
@@ -1285,8 +1616,11 @@ func main() {
 			knowledgeUC = uc
 			toolsReg.SetKnowledgeSearcher(knowledgeUC)
 			// GitHub-PAT-via-GIT_ASKPASS resolver wiring
-			// removed. SSH-style repos use ssh_identities; HTTPS auth
-			// returns in P3 via credential.helper.
+		// removed. SSH-style repos use ssh_identities; HTTPS auth
+		// returns in P3 via credential.helper.
+		// 基于 GIT_ASKPASS 的 GitHub PAT 解析器装配
+		// 已移除。SSH 风格仓库使用 ssh_identities；HTTPS 认证
+		// 将在 P3 通过 credential.helper 回归。
 			// Built-in vault seed (ADR-029) — default-on, source fixed to
 			// the public github.com/ongridio/vault with the embedded
 			// snapshot as the offline fallback. The source is NOT operator-
@@ -1303,18 +1637,38 @@ func main() {
 			// listener, so it runs in a goroutine and only when the vault
 			// isn't already indexed. The Knowledge page "云端同步" button
 			// re-runs the same SyncBuiltinVault path on demand.
+			// 内置 vault 种子（ADR-029）—— 默认开启，源固定为
+			// 公共仓库 github.com/ongridio/vault，以内嵌快照作为离线兜底。源
+			// 不可被运维方配置：旧的 ONGRID_BUILTIN_VAULT_URL "指向某个
+			// git 镜像" 的路径已被移除，因为它会把 vault 注册为
+			// knowledge_repos 行并泄漏进 代码仓库 / Repos
+			// 列表 —— Repos 是 Agent 分析的用户代码，绝非平台内容。
+			// 设置 ONGRID_BUILTIN_VAULT_SEED=off 可跳过播种（用于测试）。
+			//
+			// 默认开启的原因：首次启动时空知识库屡屡被误判为
+			// "RAG 坏了" —— 运维方期望至少平台 playbooks 应该存在。
+			// 后台同步（云端克隆、内嵌兜底）不能阻塞 HTTP
+			// listener，因此它跑在 goroutine 里，且仅当 vault
+			// 尚未被索引时才执行。知识库页面的 "云端同步" 按钮
+			// 按需重跑同一条 SyncBuiltinVault 路径。
 			if seed := strings.TrimSpace(os.Getenv("ONGRID_BUILTIN_VAULT_SEED")); seed == "-" || strings.EqualFold(seed, "off") {
 				log.Info("knowledge: built-in vault seed disabled via env")
 			} else {
 				// Migrate away any legacy vault repo row (pre-ADR-029 installs
-				// seeded the vault AS a repo) so it stops lingering in Repos.
+			// seeded the vault AS a repo) so it stops lingering in Repos.
+			// 清理旧的 vault repo 行（ADR-029 之前的安装把 vault
+			// 作为 repo 播种），使其不再残留在 Repos 中。
 				if purged, pErr := knowledgeUC.PurgeBuiltinVaultRepo(rootCtx); pErr != nil {
 					log.Warn("knowledge: purge legacy vault repo", slog.Any("err", pErr))
 				} else if purged {
 					log.Info("knowledge: migrated built-in vault off the repos table")
 				}
-				go func() {
-					syncCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+				// Background vault sync: 5-minute bounded ctx, skips if already indexed,
+			// otherwise pulls from cloud (or embedded snapshot fallback).
+			// 后台 vault 同步：5 分钟受限 ctx，若已索引则跳过，
+			// 否则从云端拉取（或回退到内嵌快照）。
+			go func() {
+				syncCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 					defer cancel()
 					if knowledgeUC.HasVaultDocs(syncCtx) {
 						log.Info("knowledge: built-in vault already indexed — skipping boot sync")
@@ -1343,6 +1697,16 @@ func main() {
 	// buildAIOpsRuntime now consumes these registries instead of
 	// building its own; the chat coordinator + worker dispatch references
 	// the same in-memory instances we hand to aiopsHandler below.
+	// AgentRegistry + SkillRegistry 无条件从
+	// ./agents + ./skills + marketplace 根目录加载。它们是元数据 ——
+	// persona 描述只是 YAML+markdown —— 所以 /v1/agents
+	// 端点即使在 chat runtime 无法构建时（未配置 LLM provider 等）
+	// 也应填充。这也让 SPA 在全新安装时能渲染助手列表，
+	// 运维方可在配置 provider 前浏览 persona。
+	//
+	// buildAIOpsRuntime 现在消费这些注册表，而非
+	// 自建；chat coordinator + worker 分发引用的
+	// 就是我们下方交给 aiopsHandler 的同一批内存实例。
 	bootstrapSkillReg, bootstrapAgentReg := loadBootstrapRegistries(log)
 
 	var (
@@ -1351,6 +1715,10 @@ func main() {
 		// self-obs sampler ticker (eg.Go in the goroutine wiring below)
 		// can call CountWorkersByStatus. The interface-typed
 		// aiopsRuntime is what the chat service consumes.
+		// chatRT 保留具体 runtime 句柄，供 ADR-026
+		// self-obs 采样 ticker（下方 goroutine 装配中的 eg.Go）
+		// 调用 CountWorkersByStatus。接口类型的
+		// aiopsRuntime 才是 chat service 消费的对象。
 		chatRT *aiopschatruntime.Runtime
 	)
 	if kernel == managersvcaiops.KernelGraph {
@@ -1644,10 +2012,15 @@ func main() {
 	// over the existing agent / tool / notify subsystems. Routes mount
 	// even when the LLM runtime is down — tool/notify/condition nodes
 	// still work; only agent nodes degrade with a clear error.
+	// Flow 编排（HLD-016）：用户编写的工作流 DAG，运行在已有的
+	// agent / tool / notify 子系统之上。即使 LLM 运行时不可用，路由也会挂载
+	// ——tool/notify/condition 节点仍能工作；只有 agent 节点会以明确的错误降级。
 	flowRepo := managerflowdata.NewRepo(db)
 	flowRunRepo := managerflowdata.NewRunRepo(db)
 	// Captured so MCP tools (discovered later, after mcpUC exists) can be
 	// appended to the same dispatch map the flow engine uses.
+	// 这里捕获 flowInvoker，是为了后续（mcpUC 创建之后）发现的 MCP 工具
+	// 能被追加到 flow 引擎所用的同一份调度表里。
 	flowInvoker := newFlowToolInvoker(toolsReg, reg)
 	flowExec := managerbizflow.Executors{
 		Tools:  flowInvoker,
@@ -1666,6 +2039,9 @@ func main() {
 	// alert fires) + cron scheduler (time-based flows). Both nil-safe and
 	// independent of the LLM runtime — tool/notify/condition flows run
 	// regardless of whether agent nodes are usable.
+	// HLD-016 触发器：告警分发器（告警触发时自动启动匹配的 flow）
+	// + cron 调度器（基于时间的 flow）。两者都 nil 安全，且独立于
+	// LLM 运行时——无论 agent 节点是否可用，tool/notify/condition 类 flow 都能运行。
 	alertUC.SetWorkflowDispatcher(managerbizflow.NewDispatcher(flowUC, log))
 	managerbizflow.NewScheduler(flowUC, log).Start(rootCtx)
 	flowHandler := managerserverflow.NewHandler(flowUC)
@@ -1680,6 +2056,13 @@ func main() {
 	// gates. Bounded by limit=100 to cap the LLM burst (the global
 	// concurrency cap further damps it). Goroutine + brief detached ctx so
 	// boot doesn't block on the DB scan.
+	// 启动补偿扫描：针对结构化 RCA 路径——在未配置 LLM provider 时
+	// 触发的告警事件，其自动调查会被静默跳过（RecordFiring 对 investigator
+	// 做了 nil 检查），导致 IncidentDetail 页面永远显示 status=not_started。
+	// 既然 investigator 已就绪，这里把最近 24h 内未启动的事件按正常的
+	// 严重度 / 进行中 / 并发上限闸门重新入队。limit=100 限制 LLM 突发量
+	// （全局并发上限会进一步压低）。用 goroutine + 短时脱离上下文，避免
+	// 启动过程被 DB 扫描阻塞。
 	if rcaInvConcrete != nil {
 		go func() {
 			bfCtx, bfCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1710,6 +2093,14 @@ func main() {
 	if errDB == nil {
 		healthDB = sqlDB
 	}
+	// System health service: aggregates the live status of every subsystem
+	// (DB / Prom / Grafana / Loki / Tempo / alert evaluator / LLM / etc.)
+	// into a single /v1/system/health snapshot consumed by the SPA status
+	// page. nil dependencies are reported as "unknown" rather than failing
+	// the whole call.
+	// 系统健康度服务：把所有子系统（DB / Prom / Grafana / Loki / Tempo /
+	// 告警评估器 / LLM 等）的实时状态聚合到 /v1/system/health 的一个快照里，
+	// 供 SPA 状态页消费。nil 依赖会被上报为 "unknown"，而不是让整次调用失败。
 	systemHealthSvc := managersvcsystemhealth.New(managersvcsystemhealth.Config{
 		Version:             version,
 		PromEnabled:         cfg.Prom.Enabled,
@@ -1747,6 +2138,11 @@ func main() {
 	// up query_knowledge.
 	// knowledgeHandler may be nil if the embedder didn't initialize —
 	// the route block below skips registration in that case.
+	// 知识库的 HTTP handler——在这里构造，挂载到下方路由。
+	// biz Usecase 与 tool registry 的 SetKnowledgeSearcher 在更早
+	// （buildAIOpsRuntime 之前）已完成，这样 BaseTool 包里才能拿到 query_knowledge。
+	// 若 embedder 没初始化成功，knowledgeHandler 可能为 nil——
+	// 下面的路由块会跳过注册。
 	var knowledgeHandler *managerserverknowledge.Handler
 	if knowledgeUC != nil {
 		knowledgeHandler = managerserverknowledge.NewHandler(knowledgeUC)
@@ -1756,6 +2152,9 @@ func main() {
 	// L2 skill framework: builtin Executors registered via init() in
 	// internal/skill/builtin (imported above). Service dispatches via
 	// frontierbound.Client; audit goes to MySQL skill_executions.
+	// L2 skill 框架：内置 Executor 通过 internal/skill/builtin
+	// （在上方 import）里的 init() 注册。Service 经 frontierbound.Client 分发；
+	// 审计写入 MySQL 的 skill_executions 表。
 	skillSvc := managerbizskill.New(
 		fbClient,
 		managerbizskill.NewGormAuditSink(db),
@@ -1765,6 +2164,10 @@ func main() {
 	// installed) in the /v1/skills catalog. They live in a separate registry
 	// from skillcore, so without this an installed pack (e.g. terrashark) is
 	// invisible in the catalog even though the agent already uses it.
+	// HLD-017：把 chatruntime 的 SKILL.md skills（内置 + marketplace 安装的）
+	// 暴露到 /v1/skills 目录中。它们位于与 skillcore 不同的注册表里，
+	// 不加这一步，已安装的 skill pack（如 terrashark）即使在 agent 中
+	// 已经被使用，在目录中也是不可见的。
 	skillSvc.WithExtraSkills(func() []managerbizskill.SkillSummary {
 		if bootstrapSkillReg == nil {
 			return nil
@@ -1800,6 +2203,11 @@ func main() {
 	// LLM provider configured) the registries are nil, the marketplace
 	// still works for List/Install but the hot-reload is a no-op until
 	// the next chatruntime construction picks the disk state up.
+	// marketplace 装配：在 /v1/marketplace/* 上提供 Install / List / Uninstall。
+	// usecase 在每次变更后都会重载 chatruntime 注册表，让新安装的 skill
+	// 无需重启就能在下一次对话中生效。当 graph 内核未构建（未配置 LLM
+	// provider）时，注册表为 nil，marketplace 的 List/Install 仍能用，
+	// 但热重载会变成 no-op，直到下一次 chatruntime 构造时读取磁盘状态。
 	var mpSkillReg managerbizmarketplace.SkillRegistry
 	var mpAgentReg managerbizmarketplace.AgentRegistry
 	if rt, ok := aiopsRuntime.(*aiopschatruntime.Runtime); ok && rt != nil {
@@ -1826,12 +2234,20 @@ func main() {
 	// Skill roots — see boot LoadAll block downstream for the full
 	// rationale. Defined here too because marketplace UC is wired
 	// before that block runs.
+	// Skill 根目录——完整设计理由见下方启动时的 LoadAll 块。
+	// 这里也定义是因为 marketplace UC 在那个块之前装配。
 	builtinSkillsRoot := firstNonEmpty(os.Getenv("ONGRID_BUILTIN_SKILLS_ROOT"), "./skills")
 	builtinAgentsRoot := firstNonEmpty(os.Getenv("ONGRID_BUILTIN_AGENTS_ROOT"), "./agents")
 	marketplaceSkillsRoot := firstNonEmpty(os.Getenv("ONGRID_SKILLS_ROOT"), "/var/lib/ongrid/skills")
 	if err := os.MkdirAll(marketplaceSkillsRoot, 0o755); err != nil {
 		log.Warn("create marketplace skills root", slog.String("path", marketplaceSkillsRoot), slog.Any("err", err))
 	}
+	// Marketplace Usecase: owns install/list/uninstall + signature gate.
+	// Hot-reload of chatruntime registries happens through mpSkillReg /
+	// mpAgentReg (nil when no graph kernel — List/Install still work).
+	// Marketplace Usecase：负责 install/list/uninstall + 签名校验闸门。
+	// chatruntime 注册表的热重载通过 mpSkillReg / mpAgentReg 完成
+	// （无 graph 内核时为 nil——List/Install 仍可用）。
 	mpUC := managerbizmarketplace.NewUsecase(mpRepo, mpSkillReg, mpAgentReg, managerbizmarketplace.Config{
 		SystemSkillsRoot:     marketplaceSkillsRoot,
 		BuiltinSkillsRoots:   []string{builtinSkillsRoot},
@@ -1845,10 +2261,14 @@ func main() {
 	marketplaceHandler := managerservermarketplace.NewHandler(mpUC)
 	// HLD-017 generic secret vault: the single semantics-agnostic credential
 	// store installed skills (and future external-MCP clients) inject from.
+	// HLD-017 通用密钥保险库：单一与语义无关的凭据存储，
+	// 已安装的 skill（以及未来的外部 MCP 客户端）从这里注入凭据。
 	secretUC := managerbizsecret.NewUsecase(managersecretdata.NewRepo(db))
 	secretHandler := managerserversecret.NewHandler(secretUC)
 	// HLD-018 MCP client: external MCP servers config + connect/list-tools.
 	// Reuses the credential vault (secretUC) for server auth injection.
+	// HLD-018 MCP 客户端：外部 MCP server 的配置 + 连接 / 列出工具。
+	// 复用凭据保险库（secretUC）做 server 的鉴权注入。
 	mcpUC := managerbizmcp.NewUsecase(managermcpdata.NewRepo(db), secretUC, log.With(slog.String("comp", "mcp")))
 	mcpHandler := managerservermcp.NewHandler(mcpUC)
 	// HLD-018 + flow: MCP tools are schema-typed callables, so they're
@@ -1859,22 +2279,39 @@ func main() {
 	// inbox gate is only for agent-initiated calls). flowInvoker is a pointer,
 	// so setting .mcp here is seen by the engine; re-set the catalog to the
 	// MCP-aware one (WithToolCatalog just stores it).
+	// HLD-018 + flow：MCP 工具是带 schema 的可调用对象，因此是 flow 中
+	// 一等公民的确定性节点（与 SKILL.md skill 不同）。mcpUC 创建后，向 flow
+	// 调色板 + 分发器接入一个 LIVE 数据源——调色板在每次编辑器加载时查询
+	// servers，工具节点直接运行它们，无需审批（已发布的 flow 节点视为预授权；
+	// 审批闸门只针对 agent 主动发起的调用）。flowInvoker 是指针，这里给 .mcp
+	// 赋值，引擎侧可见；同时把 catalog 重设为感知 MCP 的版本
+	// （WithToolCatalog 只是存储）。
 	mcpFlowSrc := &flowMCPSource{uc: mcpUC, log: log.With(slog.String("comp", "flow-mcp"))}
 	flowInvoker.mcp = mcpFlowSrc
 	flowUC.WithToolCatalog(flowToolCatalog{reg: toolsReg, mcp: mcpFlowSrc})
 	// HLD-017 propose-confirm inbox: human approval queue for dangerous
 	// actions (agent cloud-shell, etc.). Additive — empty until a producer
 	// proposes; producers register their execute-on-approve executor.
+	// HLD-017 propose-confirm 收件箱：危险动作（如 agent 的 cloud-shell）
+	// 的人工审批队列。是叠加式设计——在 producer 提议之前一直为空；
+	// producer 注册自己的"审批通过后执行"executor。
 	approvalUC := managerbizapproval.NewUsecase(managerapprovaldata.NewRepo(db), log.With(slog.String("comp", "approval")))
 	approvalHandler := managerserverapproval.NewHandler(approvalUC)
 	// HLD-017 cloud_bash producer: register the execute-on-approve executor
 	// (resolve the bound credential → inject into the Runner sandbox → run)
 	// and wire the cloud_bash tool's proposer seam to the approval inbox.
+	// HLD-017 cloud_bash producer：注册"审批通过后执行"的 executor
+	// （解析绑定的凭据 → 注入 Runner 沙箱 → 执行），
+	// 并把 cloud_bash 工具的 proposer 接口接到审批收件箱。
 	cloudBashRunner := runner.NewShellRunner()
 	// HLD-019 agent workspace: per-session persistent cwd for cloud_bash so a
 	// skill (e.g. terraform-runner) can write .tf/state in one command and read
 	// it back in the next, instead of running in a throwaway temp dir. Root is
 	// a persistent volume; empty disables it (falls back to today's temp dir).
+	// HLD-019 agent 工作区：为 cloud_bash 提供按会话持久化的 cwd，让 skill
+	// （如 terraform-runner）可以在一条命令里写 .tf/state，下一条命令再读回来，
+	// 而不是跑在用后即弃的临时目录里。根目录是持久卷；为空则禁用
+	// （回退到当前的临时目录行为）。
 	workspaceRoot := os.Getenv("ONGRID_WORKSPACE_ROOT")
 	if workspaceRoot == "" {
 		workspaceRoot = "/var/lib/ongrid/workspace"
@@ -1891,14 +2328,19 @@ func main() {
 		}
 		// Resolve each bound credential's TYPE inject rule and merge into one
 		// env. Later credentials win on key collisions (rare across types).
+		// 解析每个绑定凭据的 TYPE 注入规则，合并到一份 env 中。
+		// 当 key 冲突时，后注入的凭据覆盖前面的（不同类型间很少冲突）。
 		env := map[string]string{}
 		for _, name := range names {
 			injected, _, err := secretUC.ResolveInjection(ctx, name)
 			if err != nil {
 				// Surface the available credential names so the agent can retry
-				// with the right one instead of guessing (it tends to invent
-				// e.g. "tencent" when the vault has "tencent-prod").
-				return "", fmt.Errorf("resolve credential %q: %w%s", name, err, availableCredentialsHint(ctx, secretUC))
+			// with the right one instead of guessing (it tends to invent
+			// e.g. "tencent" when the vault has "tencent-prod").
+			// 把可用的凭据名暴露出来，让 agent 能用正确的名字重试，
+			// 而不是瞎猜（它经常凭空造出 "tencent"，
+			// 而保险库里实际叫 "tencent-prod"）。
+			return "", fmt.Errorf("resolve credential %q: %w%s", name, err, availableCredentialsHint(ctx, secretUC))
 			}
 			for k, v := range injected {
 				env[k] = v
@@ -1912,6 +2354,12 @@ func main() {
 		// entrypoint scripts under it; its bin dir + every installed skill's
 		// bin dir go on PATH. PIP_BREAK_SYSTEM_PACKAGES sidesteps PEP 668 so a
 		// non-root --user install isn't refused.
+		// 工具位于宿主机挂载的持久卷上，不在镜像里：容器重建时它们仍在，
+		// 不会让镜像变大，agent 还能在运行时装更多（每条安装命令本身
+		// 也会经过人工审批卡片）。cloudBashToolsDir 是 PYTHONUSERBASE，
+		// 所以 `pip install`（PIP_USER）会把包和入口脚本放在它下面；
+		// 它的 bin 目录 + 每个已安装 skill 的 bin 目录都会进入 PATH。
+		// PIP_BREAK_SYSTEM_PACKAGES 绕过 PEP 668，避免非 root 的 --user 安装被拒。
 		env["PATH"] = cloudBashToolsDir + "/bin:" + skillBinPATH(marketplaceSkillsRoot)
 		env["PYTHONUSERBASE"] = cloudBashToolsDir
 		env["PIP_USER"] = "1"
@@ -1920,11 +2368,16 @@ func main() {
 		// Optional pip index mirror — tccli + deps from pypi.org can take many
 		// minutes from a China-based host; a mirror cuts it to seconds. Generic
 		// (empty default = pypi); the test env sets it to a Tsinghua mirror.
+		// 可选的 pip 索引镜像——从国内主机访问 pypi.org 拉 tccli + 依赖
+		// 可能要好几分钟，用镜像可缩短到几秒。通用配置（默认为空 = pypi）；
+		// 测试环境会设成清华镜像。
 		if idx := strings.TrimSpace(os.Getenv("ONGRID_PIP_INDEX_URL")); idx != "" {
 			env["PIP_INDEX_URL"] = idx
 		}
 		// Resolve the session's persistent workspace as cwd (HLD-019). Empty
 		// workdir → runner uses a transient temp dir (legacy behavior).
+		// 解析会话的持久化工作区作为 cwd（HLD-019）。workdir 为空时
+		// → runner 使用一次性临时目录（旧行为）。
 		workdir, err := wsMgr.Session(p.SessionID)
 		if err != nil {
 			return "", err
@@ -1936,6 +2389,12 @@ func main() {
 		// fails with a permission/HOME error (the sandbox is non-root and the
 		// passwd home doesn't exist). Point HOME at the session's persistent
 		// workspace so that per-tool state also survives across commands.
+		// 给命令一个可写的 HOME。runner 只把这份 env map 传给子进程
+		// （不会继承 manager 的环境），所以不设 HOME 的话它就为空，
+		// 任何启动时写 dotdir 的工具——tccli → ~/.tccli、awscli → ~/.aws、
+		// terraform 插件缓存——都会因权限/HOME 报错（沙箱是非 root 用户、
+		// passwd 里的 home 目录不存在）。把 HOME 指向会话的持久化工作区，
+		// 这样各工具的状态也能跨命令保留。
 		if workdir != "" {
 			env["HOME"] = workdir
 		}
@@ -1949,6 +2408,10 @@ func main() {
 		})
 		return string(out), nil
 	})
+	// host_bash executor: on approve, run a bash command against selected
+	// host devices via the BashTool's RunApproved path (frontier-bound).
+	// host_bash executor：审批通过后，通过 BashTool 的 RunApproved 路径
+	// 在选定的主机设备上执行 bash 命令（经 frontier 下发）。
 	approvalUC.RegisterExecutor("host_bash", func(ctx context.Context, payloadJSON string) (string, error) {
 		var p hostBashPayload
 		if err := json.Unmarshal([]byte(payloadJSON), &p); err != nil {
@@ -1959,6 +2422,8 @@ func main() {
 	})
 	// HLD-018 P2: mcp_call executor — on approve, connect the server and run
 	// the tool. Trusted servers skip this and run synchronously in the tool.
+	// HLD-018 P2：mcp_call executor——审批通过后，连接 server 并执行工具。
+	// 受信任的 server 跳过这一步，直接在工具内同步执行。
 	approvalUC.RegisterExecutor("mcp_call", func(ctx context.Context, payloadJSON string) (string, error) {
 		var p mcpCallPayload
 		if err := json.Unmarshal([]byte(payloadJSON), &p); err != nil {
@@ -1977,6 +2442,11 @@ func main() {
 	// Class=destructive — a skill can ship a binary cloud_bash later runs, so
 	// this only runs after a human approves. The approval IS the authorization,
 	// so the install runs with admin authority; installed_by = proposing user.
+	// 对话式 skill 安装（扩展）：审批通过后，从用户提供的来源拉取并安装 pack，
+	// 然后总结安装结果（包含凭据槽位，方便 agent 接下来提示用户绑定凭据）。
+	// Class=destructive——skill 可能附带二进制文件，后续会被 cloud_bash 执行，
+	// 因此只有人工审批后才会运行。审批即授权，所以安装以 admin 权限执行；
+	// installed_by = 提议安装的用户。
 	approvalUC.RegisterExecutor("install_skill", func(ctx context.Context, payloadJSON string) (string, error) {
 		var p installSkillPayload
 		if err := json.Unmarshal([]byte(payloadJSON), &p); err != nil {
@@ -2004,10 +2474,14 @@ func main() {
 	// send_im_message: the assistant can proactively push to a configured
 	// channel (飞书/钉钉/…), reusing the same BuildSenderFromChannel path the
 	// alert notifier + flow notify node use.
+	// send_im_message：assistant 可以主动向已配置的渠道（飞书 / 钉钉 / ……）
+	// 推送消息，复用告警通知器和 flow notify 节点使用的同一条 BuildSenderFromChannel 路径。
 	toolsReg.SetIMSender(imSenderShim{channels: alertRepo, router: notifyRouter})
 	// serve_page: the assistant can host a generated HTML report at an
 	// internal /pages/<token> URL. Pages live on the persistent volume; the
 	// route is registered on the mux below.
+	// serve_page：assistant 可以把生成的 HTML 报告托管在
+	// 内部 /pages/<token> URL 上。页面文件位于持久卷上；路由挂在下面的 mux 上。
 	pagesDir := "/var/lib/ongrid/pages"
 	if d := os.Getenv("ONGRID_PAGES_DIR"); d != "" {
 		pagesDir = d
@@ -2028,6 +2502,15 @@ func main() {
 	// live bag here, exactly like the AgentTool trio above. The coordinator
 	// (coordinatorToolNames) and specialist-ops (persona Tools list) filters
 	// both whitelist cloud_bash, so this single append reaches both.
+	// chatruntime 的工具袋在更上方（约 1274 行）就编译好了，那时 cloud_bash
+	// 的 proposer 还不存在，所以 BuildBaseTools 不会产出 cloud_bash。
+	// SetCloudBashProposer 只能修正 /v1/skills 和后续新建的工具袋，
+	// 已经构建好的 coordinator/worker 图里仍然缺这个工具——而系统提示词
+	// 又告诉 LLM 有 cloud_bash，于是它会发起一次 eino 无法路由的调用，
+	// 让整个流以 "tool cloud_bash not found in toolsNode indexes" 失败。
+	// 这里像上方的 AgentTool 三件套一样，把它挂到运行中的工具袋上。
+	// coordinator（coordinatorToolNames）和 specialist-ops（persona Tools 列表）
+	// 两个过滤器都把 cloud_bash 加进了白名单，所以这一次 append 就能同时覆盖两者。
 	if chatRT != nil {
 		cbDeps := aiopstoolsdec.Deps{
 			// HLD-021: cloud_bash now BLOCKS in-tool until the human approves
@@ -2036,6 +2519,11 @@ func main() {
 			// a minute longer so the tool's own clean timeout blob wins over a
 			// decorator-imposed ErrToolTimeout. install_skill (same deps)
 			// still returns instantly, so the long bound is harmless there.
+			// HLD-021：cloud_bash 现在会在工具内阻塞，直到人工审批通过
+			// （同步 propose-confirm），所以单次调用的超时必须长于审批等待预算
+			// （approvalWaitTimeout = 30m）——再多 1 分钟，让工具自己的
+			// 干净超时提示能盖过 decorator 抛出的 ErrToolTimeout。
+			// install_skill（共用这套 deps）仍然会立即返回，长超时对它无害。
 			Timeout:    approvalWaitTimeout + time.Minute,
 			Limiter:    aiopstoolsdec.NewTokenBucketLimiter(0),
 			Registerer: reg,
@@ -2047,6 +2535,12 @@ func main() {
 		// (no human-approval gate), so a short timeout, not cbDeps' 31m ceiling.
 		// First registration on reg here (not in the startup bag) → no
 		// double-register.
+		// serve_page + send_im_message 在 buildAIOpsRuntime 之后才注册
+		// （即上面的 SetPageStore / SetIMSender），所以和 cloud_bash 一样，
+		// 它们不在启动时的对话工具袋里，LLM 在对话中无法调用——
+		// 这正是 agent "从未触发 serve_page" 的原因。它们是即时返回的
+		// （没有人工审批环节），所以用短超时，而不是 cbDeps 那个 31 分钟的上限。
+		// 这里是首次在 reg 上注册（启动包里没有）→ 不会重复注册。
 		quickDeps := aiopstoolsdec.Deps{
 			Timeout:    60 * time.Second,
 			Limiter:    aiopstoolsdec.NewTokenBucketLimiter(0),
@@ -2063,11 +2557,17 @@ func main() {
 		// HLD-017: wire the active-skill → bound-credentials resolver so
 		// cloud_bash auto-injects the credentials an active skill was bound
 		// to at install time (design-time binding, no run-time choice).
+		// HLD-017：接入"当前激活 skill → 已绑定凭据"的解析器，
+		// 让 cloud_bash 自动注入该 skill 在安装时绑定的凭据
+		// （设计期绑定，运行时无需选择）。
 		chatRT.SetCredentialBinder(mpUC)
 		// Admin write-action gate: consult the agent/write_enabled system
 		// setting live on every chat request. When an admin turns it off the
 		// agent goes read-only (all non-read tools stripped from the LLM's
 		// toolbag). Default (unset) resolves to enabled, preserving behaviour.
+		// 管理员写操作闸门：每次 chat 请求都实时读取 agent/write_enabled 系统
+		// 设置。管理员关闭后，agent 进入只读模式（所有非读工具从 LLM 工具袋中
+		// 剥离）。默认（未设置）解析为启用，保持旧行为。
 		chatRT.SetAgentWriteEnabledProvider(func(ctx context.Context) bool {
 			return settingSvc.AgentWriteEnabled(ctx)
 		})
@@ -2076,6 +2576,10 @@ func main() {
 		// servers' tools run synchronously; others queue to the approval
 		// inbox. Best-effort per server — a slow/unreachable server is logged
 		// and skipped, never blocks boot.
+		// HLD-018 P2：连接每个启用的 MCP server，拉取其工具列表，
+		// 以 mcp__<server>__<tool> 的形式挂到工具袋上。受信任 server 的工具
+		// 同步执行；其余的进入审批收件箱排队。每个 server 都是 best-effort——
+		// 慢或不可达的 server 会被记日志并跳过，绝不阻塞启动。
 		mcpDeps := aiopstoolsdec.Deps{
 			Timeout:    90 * time.Second,
 			Limiter:    aiopstoolsdec.NewTokenBucketLimiter(0),
@@ -2087,6 +2591,9 @@ func main() {
 		// snapshot; agent-initiated calls respect each server's trusted flag /
 		// approval). The FLOW path uses the LIVE flowMCPSource wired above, so
 		// it isn't touched here.
+		// Chat 路径：把启用 server 的工具挂到 chat 工具袋上（启动时的快照；
+		// agent 主动发起的调用会遵循各 server 的 trusted 标志 / 审批规则）。
+		// FLOW 路径用的是上面接入的 LIVE flowMCPSource，所以这里不改动它。
 		if servers, err := mcpUC.ListEnabled(rootCtx); err == nil {
 			var mcpTools []aiopstoolsbase.BaseTool
 			for _, srv := range servers {
@@ -2133,12 +2640,19 @@ func main() {
 	// docker-internal). The skill returns a skipped_reason envelope
 	// when the chosen provider is missing a key / unreachable, so this
 	// is safe to call even before any operator configures the integration.
+	// 把多 provider 配置解析器接入 manager 作用域的 web_search 内置工具。
+	// 默认 provider 是 SearXNG（零配置，docker 内部通信）。当所选 provider
+	// 缺 key 或不可达时，skill 会返回一个 skipped_reason 封装，所以即使
+	// 运维方还没配置集成，调用也是安全的。
 	skillbuiltin.SetWebSearchConfigResolver(managerbizsetting.NewWebSearchResolver(settingSvc))
 
 	// Subprocess skill loader: walks each allowlist root and registers
 	// SubprocessSkills for every skill.json found. Empty dir list =
 	// nothing loaded; missing dirs are logged and skipped so a fresh
 	// install with no /etc/ongrid/skills boots cleanly.
+	// 子进程 skill 加载器：遍历每个白名单根目录，为找到的每个 skill.json
+	// 注册 SubprocessSkill。目录列表为空 = 什么都不加载；缺失的目录会
+	// 被记日志并跳过，保证全新安装（没有 /etc/ongrid/skills）也能干净启动。
 	if loaded, err := skillcore.LoadDirs(skillcore.LoaderConfig{
 		Dirs: cfg.Skills.ExternalDirs,
 		Logger: func(format string, args ...any) {

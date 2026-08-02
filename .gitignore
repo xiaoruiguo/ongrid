@@ -52,6 +52,9 @@ go.work.sum
 .vscode/
 .DS_Store
 
+cmd/ollama/frontend/node_modules/
+cmd/ollama/frontend/dist/
+cmd/ollama/frontend/tsconfig.tsbuildinfo
 # Claude Code transient files
 .claude/
 web/dist/
