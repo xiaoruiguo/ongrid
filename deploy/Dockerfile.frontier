@@ -1,30 +1,88 @@
 # syntax=docker/dockerfile:1.7
+# 启用 BuildKit 前端语法 1.7，解锁 heredoc、--mount、--chmod 等高级特性；
+# 必须放在第一行，Docker 解析器指令。
 
 FROM golang:1.24-alpine AS builder
+# 第一阶段：构建器镜像，使用 Go 1.24 官方 alpine 变体（体积小）；
+# 命名为 builder，后续阶段通过 --from=builder 引用。
 
 RUN apk add --no-cache build-base make
+# 安装编译工具链 build-base（gcc/musl/make 等）和 make；
+# --no-cache 不写 apk 缓存索引，减小镜像层体积。
 
 ENV GO111MODULE=on \
     GOPROXY=https://goproxy.cn,https://goproxy.io,https://proxy.golang.org,direct \
     CGO_CFLAGS="-D_LARGEFILE64_SOURCE"
+# 设置构建期环境变量：
+# GO111MODULE=on 强制使用 Go Modules（不回退 GOPATH 模式）；
+# GOPROXY 配置模块代理拉取顺序：国内 goproxy.cn → 备用 goproxy.io → 官方 proxy.golang.org → 直连；
+#   多镜像逗号分隔，首个失败自动 fallback 到下一个，兼顾国内网络环境与可用性。
+# CGO_CFLAGS=-D_LARGEFILE64_SOURCE 给 C 编译器加宏，启用 64 位文件偏移（LFS），
+#   解决 musl/alpine 下大文件（>2GB）读写时的 off_t 截断问题。
 
 WORKDIR /go/src/github.com/singchia/frontier
+# 设定容器内工作目录；沿用 GitHub 仓库路径作为 GOPATH 风格路径，
+# 兼容历史 import path（部分 Go 项目仍按 $GOPATH/src/<host>/<owner>/<repo> 布局）。
+
 COPY . .
+# 将构建上下文（当前仓库根目录）所有文件复制到 WORKDIR；
+# 包括源码、Makefile、go.mod/go.sum 等。注意 .dockerignore 会过滤掉无关文件。
 
 RUN make DESTDIR=/tmp/install all install-frontier
+# 执行 Makefile：
+#   all           —— 先编译所有目标（frontier 二进制 + 配置 + 静态资源等）
+#   install-frontier —— 将 frontier 相关产物按 DESTDIR 前缀安装到 /tmp/install/，
+#                      典型布局为 /tmp/install/usr/bin/frontier + /tmp/install/usr/conf/frontier.yaml
+#   DESTDIR=/tmp/install —— Makefile install 规则的安装根目录前缀，
+#                      下一阶段用 COPY --from=builder /tmp/install/ / 整体搬运。
+# 这种 DESTDIR 模式是标准 GNU/Autotools 约定，保证 install 路径与运行时路径一致。
 
 FROM alpine:3.20
+# 第二阶段：运行时镜像，使用 alpine 3.20（musl libc，约 7MB）；
+# 不带 builder 标签，表示这是最终镜像的起点。
 
 RUN apk add --no-cache ca-certificates \
     && addgroup -S -g 65532 frontier \
     && adduser -S -D -H -u 65532 -G frontier frontier
+# 一条 RUN 完成两件事（减少镜像层数）：
+# 1. 安装 ca-certificates：系统 CA 证书包，HTTPS 客户端验证服务端证书必需；
+#    frontier 作为 RPC 服务端/客户端会发起出站 TLS 连接（如对接 Tempo/Loki）。
+# 2. 创建非 root 运行用户：
+#    addgroup -S -g 65532 frontier —— 系统组（-S 不分配 GID 段），固定 GID 65532；
+#    adduser -S -D -H -u 65532 -G frontier frontier：
+#      -S 系统用户（不进 /etc/passwd 的普通用户段）
+#      -D 不创建密码
+#      -H 不创建 home 目录
+#      -u 65532 固定 UID（与 GID 一致，便于 distroless/非 root 规范）
+#      -G frontier 加入 frontier 组
+# 65532 是 distroless 使用的非特权 UID/GID，与 Kubernetes securityContext.runAsNonRoot 兼容。
 
 COPY --from=builder /tmp/install/ /
+# 从 builder 阶段把安装产物整体复制到运行时镜像根目录；
+# /tmp/install/usr/bin/frontier → /usr/bin/frontier
+# /tmp/install/usr/conf/frontier.yaml → /usr/conf/frontier.yaml
+# 路径与运行时 ENTRYPOINT/CMD 引用一致。这是多阶段构建的核心：最终镜像不含编译器、源码、缓存。
 
 USER 65532:65532
+# 切换到非 root 用户（UID:GID = 65532:65532）；
+# 后续所有 RUN/CMD/ENTRYPOINT 都以该用户身份执行。
+# 满足 AGENTS.md 安全红线"容器以非 root 用户运行"，
+# 也满足 Kubernetes runAsNonRoot Pod Security Standard restricted 级别要求。
 
 EXPOSE 40011
+# 声明容器监听 40011 端口（frontier 主服务端口，RPC/HTTP）；
+# EXPOSE 仅是文档性声明，不实际发布端口，需 docker run -p 或 Kubernetes Service 映射。
+
 EXPOSE 40012
+# 声明容器监听 40012 端口（frontier 副端口，通常用于监控/metrics 或管理 API）；
+# 与 40011 分离，便于在 Kubernetes 中用不同 Service 暴露给不同消费者。
 
 ENTRYPOINT ["/usr/bin/frontier"]
+# 容器启动入口固定为 frontier 二进制；
+# 不可被 docker run <image> <cmd> 覆盖，保证镜像只能作为 frontier 服务运行。
+# 使用 exec 数组形式（非 shell 字符串），直接 exec 不经过 /bin/sh，信号传递干净。
+
 CMD ["--config", "/usr/conf/frontier.yaml"]
+# 默认参数：指定配置文件路径；
+# 可被 docker run <image> <args> 或 Kubernetes command/args 覆盖。
+# 与 ENTRYPOINT 组合后实际执行：/usr/bin/frontier --config /usr/conf/frontier.yaml

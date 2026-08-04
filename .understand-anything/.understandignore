@@ -1,0 +1,65 @@
+# .understandignore — patterns for files/dirs to exclude from analysis
+# Syntax: same as .gitignore (globs, # comments, ! negation, trailing / for dirs)
+# Lines below are suggestions — uncomment to activate.
+# Use ! prefix to force-include something excluded by defaults.
+#
+# Built-in defaults (always excluded unless negated):
+#   node_modules/, .git/, dist/, build/, obj/, *.lock, *.min.js, etc.
+#
+# --- From .gitignore (uncomment to exclude) ---
+
+# *.exe
+# *.exe~
+# *.dll
+# *.so
+# *.dylib
+# .codegraph
+# *.test
+# *.out
+# coverage.out
+# coverage.html
+# bin/
+# dist/stage/
+# dist/out/
+# tmp/
+# /ongrid
+# /ongrid-frontier
+# /ongrid-edge
+# dist/stage/
+# dist/out/
+# bin/linux-*
+# bin/darwin-*
+# bin/windows-*
+# go.work
+# go.work.sum
+# .env
+# .env.*
+# !.env.example
+# *.local.yaml
+# *.local.yml
+# .DS_Store
+# cmd/ollama/frontend/node_modules/
+# cmd/ollama/frontend/dist/
+# cmd/ollama/frontend/tsconfig.tsbuildinfo
+# .claude/
+# web/dist/
+# web/node_modules/
+# web/tsconfig.tsbuildinfo
+# /.playwright-cli/
+# /output/
+# deploy/docker-compose.override.yml
+# deploy/certs/
+# deploy/install/certs/
+# /local/
+
+# --- Detected directories (uncomment to exclude) ---
+
+# tests/
+# docs/
+# scripts/
+
+# --- Test file patterns (uncomment to exclude) ---
+
+# *.test.*
+# *.spec.*
+# *.snap
