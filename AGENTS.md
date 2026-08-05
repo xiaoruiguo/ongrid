@@ -129,6 +129,178 @@
 
 完整规范、所有子主题的具体细节、模板和自查清单见 `spec/spec.md` 的任务路由表。
 
+---
+
+## 技术栈（含版本）
+
+> 项目版本：`v0.10.2`（见 `VERSION`）。版本号除特别说明外，均来自 `go.mod` / `web/package.json` / `cmd/ollama/frontend/package.json` / `deploy/docker-compose.yml` / `Makefile` / `.tool-versions`。
+
+### 后端（Go）
+
+- **语言 / 工具链**：Go `1.25.0`（`go.mod` 声明）；`.tool-versions` 指定 `golang 1.25.11`。Module：`github.com/ongridio/ongrid`。
+- **HTTP 框架**：`go-chi/chi/v5` v5.1.0
+- **ORM / 数据访问**：
+  - `gorm.io/gorm` v1.31.1
+  - `gorm.io/driver/mysql` v1.6.0
+  - `gorm.io/plugin/soft_delete` v1.2.1（软删除）
+  - `glebarez/sqlite` v1.11.0（CGO SQLite，本地开发可选）
+  - `modernc.org/sqlite` v1.42.2（pure-Go SQLite，间接依赖）
+  - `go-sql-driver/mysql` v1.9.3
+  - `jackc/pgx/v5` v5.8.0（间接，Postgres 驱动）
+  - `microsoft/go-mssqldb` v1.9.5（间接，SQL Server 驱动）
+- **认证 / 授权**：
+  - `golang-jwt/jwt/v5` v5.3.0（JWT）
+  - `golang.org/x/crypto` v0.50.0（bcrypt / argon2id）
+  - `casbin/casbin/v2` v2.103.0 + `casbin/gorm-adapter/v3` v3.32.0（RBAC）
+- **RPC / 隧道**：
+  - `singchia/frontier` v1.2.4（边端 ↔ 云端 tunnel broker，端口 40012 边端拨入 / 40011 服务端）
+  - `singchia/geminio` v1.3.0-rc.2（RPC 库）
+  - `google.golang.org/grpc` v1.80.0（间接，protobuf 生成的 gRPC stub）
+  - `google.golang.org/protobuf` v1.36.11
+  - `gorilla/websocket` v1.5.3（前端 SSE / WS 推流）
+- **AI / LLM / RAG**：
+  - `cloudwego/eino` v0.8.7（Agent 内核，graph 模式默认）
+  - `eino-contrib/jsonschema` v1.0.3
+  - `sashabaranov/go-openai` v1.41.2（OpenAI 兼容客户端，路由 Anthropic / GLM / DeepSeek / Gemini / Kimi 等）
+  - `anush008/fastembed-go` v1.0.0（本地 ONNX 嵌入）
+  - `yalue/onnxruntime_go` v1.7.0（间接，ONNX Runtime cgo 绑定；运行时 `libonnxruntime.so` v1.20.1）
+  - `sugarme/tokenizer` v0.2.3-0.20230829214935（间接，HuggingFace tokenizer）
+- **可观测性**：
+  - `prometheus/client_golang` v1.20.5、`client_model` v0.6.1、`common` v0.55.0、`procfs` v0.15.1
+  - `go.opentelemetry.io/otel` v1.43.0 + `sdk` v1.43.0 + `otelhttp` v0.68.0 + `otlptracehttp` v1.43.0
+  - `shirou/gopsutil/v3` v3.23.6（主机指标采集；`v4` v4.26.3 间接）
+- **IM 集成**：
+  - `larksuite/oapi-sdk-go/v3` v3.5.4（飞书 / Lark）
+  - `open-dingtalk/dingtalk-stream-sdk-go` v0.9.1（钉钉）
+- **Markdown / 文档解析**：
+  - `yuin/goldmark` v1.8.2
+  - `ledongthuc/pdf` v0.0.0-20250511090121-5959a4027728
+- **定时任务**：`robfig/cron/v3` v3.0.1
+- **系统 / 杂项**：
+  - `golang.org/x/sync` v0.20.0、`golang.org/x/time` v0.15.0、`golang.org/x/net` v0.52.0、`golang.org/x/sys` v0.43.0、`golang.org/x/text` v0.36.0
+  - `golang/snappy` v0.0.4（压缩）
+  - `google/uuid` v1.6.0
+  - `gopkg.in/yaml.v3` v3.0.1
+  - `klauspost/compress` v1.18.5、`k8s.io/klog/v2` v2.120.1（间接）
+- **测试**：
+  - `stretchr/testify` v1.11.1
+  - `testcontainers/testcontainers-go` v0.42.0 + `modules/mysql` v0.42.0（集成测试）
+  - `testcontainers` 链路依赖 `moby/moby` v0.4.0、`go-ole`、`tklauser` 等
+
+### API / Proto
+
+- **buf** v1.47.2（`.tool-versions`）。`api/buf.yaml` v2，lint `STANDARD`，breaking `FILE`。
+- **代码生成插件**（`api/buf.gen.yaml`）：
+  - `buf.build/protocolbuffers/go` v1.34.2
+  - `buf.build/grpc/go` v1.5.1（`require_unimplemented_servers=true`，`paths=source_relative`）
+- **proto 资产**：`api/iam/v1`、`api/manager/{aiops,alert,edge,k8s,metric,notification,setting}/v1`、`api/tunnel/v1`。
+- 回退：未装 buf 时用 `protoc` + `protoc-gen-go` + `protoc-gen-go-grpc`（见 `Makefile` `proto` target）。
+
+### 数据存储
+
+- **MySQL** `8.0`（主存储；compose 镜像 `docker.cnb.cool/ongridio/ongrid/mysql:8.0`，`utf8mb4` / `utf8mb4_unicode_ci`）
+- **SQLite**（可选，单机本地开发；`ONGRID_DB_DIALECT=sqlite`）
+- **Qdrant** `v1.11.3`（向量库，RAG 知识库；HTTP 6333，仅集群内访问）
+- **Prometheus** `v2.54.0`（指标 TSDB；90d / 20GB 保留；开启 `--web.enable-remote-write-receiver`）
+- **Loki** `3.4.0`（日志后端，单二进制；HTTP 3100 仅集群内）
+- **Tempo** `2.10.0`（追踪后端，单二进制；OTLP gRPC 4317 / HTTP 4318 不对外）
+- **Grafana** `11.1.4`（`grafana-oss`，可视化 / 探索；嵌入式部署在 `/grafana` 子路径）
+- **SearXNG** `latest`（自托管元搜索，`web_search` 工具默认后端；HTTP 8080 仅集群内）
+- **Ollama** `latest`（可选，本地 LLM；GPU 直通，端口 11434）
+- **数据库迁移**：`golang-migrate/migrate` v4.18.1（`.tool-versions`），迁移文件目录 `db/migrations`（`Makefile` `migrate-up` / `migrate-down`）。
+
+### 前端（主 SPA `web/`）
+
+- **框架**：React `18.3.1` + `react-dom` `18.3.1`
+- **路由**：`react-router-dom` `6.27.0`
+- **状态**：`zustand` `5.0.1`
+- **图表**：`recharts` `2.13.3`（d3 / victory 系列，间接）
+- **工作流图**：`@xyflow/react` `12.10.2` + `@dagrejs/dagre` `3.0.0`
+- **图标**：`lucide-react` `0.460.0`
+- **Markdown**：`react-markdown` `9.0.1` + `remark-gfm` `4.0.0`
+- **终端**：`xterm` `5.3.0` + `xterm-addon-fit` `0.8.0` + `xterm-addon-web-links` `0.9.0`
+- **构建 / 工具链**：
+  - TypeScript `5.6.3`（`tsconfig.json` target `ES2020`，`strict: true`，`moduleResolution: bundler`）
+  - Vite `5.4.10` + `@vitejs/plugin-react` `4.3.3`
+  - TailwindCSS `3.4.14`（`darkMode: 'class'`，自定义 CSS 变量配色）+ PostCSS `8.4.47` + autoprefixer `10.4.20`
+  - ESLint `8.57.1` + `@typescript-eslint/{eslint-plugin,parser}` `7.18.0` + `eslint-plugin-react-hooks` `4.6.2` + `eslint-plugin-react-refresh` `0.4.14`
+  - `@types/node` `20.16.10`、`@types/react` `18.3.12`、`@types/react-dom` `18.3.1`
+- **测试**：
+  - Vitest `1.6.1` + jsdom `23.2.0`
+  - `@testing-library/react` `14.3.1` + `@testing-library/jest-dom` `6.9.1` + `@testing-library/user-event` `14.6.1`
+  - `msw` `2.14.4`（API mock）
+  - `@playwright/test` `1.61.1`（E2E，`web/e2e/`）
+
+### 前端（Ollama 子前端 `cmd/ollama/frontend/`）
+
+> 独立小前端，仅用于本地 Ollama 聊天测试，不进生产镜像。
+
+- React `19.2.8` + react-dom `19.2.8`
+- Vite `8.2.0` + `@vitejs/plugin-react` `6.0.4`
+- ESLint `10.8.0` + `@eslint/js` `10.0.1` + `eslint-plugin-react-hooks` `7.1.1` + `eslint-plugin-react-refresh` `0.5.3`
+- `globals` `17.7.0`、`@types/react` `19.2.17`、`@types/react-dom` `19.2.3`
+
+### 边端 Agent（`ongrid-edge`）内置插件
+
+- **promtail** `3.4.0`（日志采集 → Loki）
+- **node_exporter** `1.8.2`（主机指标）
+- **process-exporter** `0.8.4`（进程指标）
+- **otelcol-contrib** `0.118.0`（OpenTelemetry Collector，traces）
+- **数据库 exporter（可选，linux-only）**：
+  - `mysqld_exporter` `0.19.0`
+  - `postgres_exporter` `0.19.1`
+  - `redis_exporter` `1.86.0`
+  - `mongodb_exporter` `0.51.0`
+
+### 部署 / 容器
+
+- **Docker** 多阶段构建（`syntax=docker/dockerfile:1.7`）：
+  - `deploy/Dockerfile.ongrid`：builder `golang:1.25-bookworm`（CGO=1，链接 libonnxruntime），runtime `debian:bookworm-slim`，非 root（uid 65532），内嵌 `ONNX Runtime` `1.20.1`、Python3 / pip（cloud_bash 工具运行时安装）
+  - `deploy/Dockerfile.ongrid-edge`：builder `golang:1.25-alpine`（CGO=0），runtime `gcr.io/distroless/base-debian12:nonroot`，5 个独立 stage 下载 promtail / node_exporter / process_exporter / otelcol-contrib
+  - `deploy/Dockerfile.web`：builder `node:20-alpine`，runtime `nginx:1.27-alpine`，SPA 内嵌 + `deploy/nginx/nginx.conf`
+  - `deploy/Dockerfile.frontier`：本地构建上游 `singchia/frontier`（仅 dev；生产用 CNB 镜像）
+- **Docker Compose**：`deploy/docker-compose.yml`（本地开发）+ `deploy/install/docker-compose.yml`（生产安装包）。运行镜像统一拉自 `docker.cnb.cool/ongridio/ongrid/...`。
+- **Kubernetes**：`deploy/kubernetes/ongrid-edge/`（Helm Chart `apiVersion: v2`，`ongrid-edge`，多架构 `linux/amd64,linux/arm64`）。Chart 发布到 OCI 制品库 `helm.cnb.cool/ongridio`。
+- **NGINX** `1.27-alpine`：TLS 终止 + SPA 静态托管 + `/api`、`/prometheus`、`/loki`、`/v1/traces`、`/grafana` 反向代理（`auth_request` → manager `edgeauth`）。
+- **CNB 制品库**：`docker.cnb.cool/ongridio/ongrid`（容器镜像）、`helm.cnb.cool/ongridio`（Helm OCI）。
+
+### CI / CD
+
+- **GitHub Actions**：
+  - `actions/checkout@v4`、`actions/setup-go@v5`（Go `1.25.x`）、`actions/setup-node@v4`（Node `22`）
+  - `bufbuild/buf-setup-action@v1`
+  - `azure/setup-helm@v4`
+  - `docker/setup-qemu-action@v3`、`docker/setup-buildx-action@v3`、`docker/login-action@v3`
+  - `actions/upload-artifact@v4` / `actions/download-artifact@v4`
+- **Runners**：`ubuntu-24.04`（amd64）+ `ubuntu-24.04-arm`（arm64）
+- **工作流**：`.github/workflows/ci.yml`（push / PR：`go build` + `go vet` + `go test -race` + `buf lint` + `web test` + `web build` + 部署清单校验 + Helm chart 校验）、`.github/workflows/release.yml`（tag `v*.*.*` 触发：发布多架构镜像 + Helm chart + amd64/arm64 release tarball）、`.github/workflows/contribution-terms.yml`。
+
+### Lint / 静态检查
+
+- **golangci-lint** `1.61.0`（`.tool-versions`；`.golangci.yml` 启用 `gofmt` / `goimports` / `govet` / `staticcheck` / `errcheck` / `revive` / `gosec` / `sqlclosecheck` / `misspell` / `ineffassign` / `unused` / `gocyclo`，`gocyclo.min-complexity: 15`，本地前缀 `github.com/ongridio/ongrid`）
+- **go-arch-lint**（校验分层边界，`Makefile` `arch-lint`，`.go-arch-lint.yml`）
+- **buf lint**（STANDARD，例外 `PACKAGE_DIRECTORY_MATCH`）
+
+### LLM / Embedding Provider（运行时配置）
+
+- **LLM**（`ONGRID_LLM_DEFAULT_PROVIDER` 切换）：OpenAI（默认 `gpt-4o`）、Anthropic、Google Gemini、智谱 GLM、DeepSeek、Kimi（Moonshot）、Ollama（本地）
+- **Embedding**：
+  - `ONGRID_EMBEDDING_PROVIDER=openai`：`text-embedding-3-small`（1536 维，OpenAI 兼容 / GLM / Qwen 通用）
+  - `ONGRID_EMBEDDING_PROVIDER=local`：BGE-small-zh-v1.5 ONNX（512 维，离线 RAG，fastembed-go 加载）
+
+### 通知渠道（`ONGRID_NOTIFY_*`）
+
+- 内置 log（dry-run）
+- 通用 Webhook（带 `X-Ongrid-Signature` HMAC 签名）
+- Slack / 飞书 / 钉钉（incoming webhook）
+
+### 架构边界
+
+- **monorepo**：`cmd/{ongrid,ongrid-edge,chi,mytest,ollama}` + `internal/{edgeagent,iam,manager,pkg,skill}` + `api/` + `web/` + `deploy/` + `docs/` + `tests/e2e` + `agents/` + `skills/`。
+- **云端** `ongrid`：`cmd → web → controlplane → repo → model`，禁止跨层调用。
+- **边端** `ongrid-edge`：拨号 `frontier:40012` 出站，不开任何入站服务端口（仅本地 `:9101/metrics`）。
+- **域间通信**：`internal/<domain>` 之间禁止直接 import，必须通过 API / 事件 / `internal/shared/`。
+
 <!-- OPENWIKI:START -->
 
 ## OpenWiki
