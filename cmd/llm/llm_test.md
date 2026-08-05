@@ -1156,3 +1156,171 @@ llm-api-test:
 - [ ] §6 端到端 happy path 完整跑通
 - [ ] §7 错误场景至少验证 5 项
 - [ ] §8 清理流程执行,数据库无残留测试数据
+
+---
+
+## 13. 交付物清单
+
+### 13.1 `cmd/llm/main.go`(1475 行)
+
+纯 Go 标准库实现的 ongrid LLM API 端到端测试客户端,无外部依赖。
+
+**技术栈**:
+- `net/http` — HTTP 客户端
+- `encoding/json` — JSON 编解码
+- `flag` — 子命令 + 参数解析
+- `mime/multipart` — 文件上传
+- `bufio` — SSE 流式解析
+- `log/slog` — 结构化日志(stderr)
+
+**核心结构**:
+
+| 组件 | 位置(main.go:line) | 说明 |
+|---|---|---|
+| 全局 flag | `:128-135` | `-addr` / `-email` / `-pass` / `-token` / `-json` / `-v` |
+| 命令注册表 | `:152-167` | `cmds []cmd` + `reg()` + `main()` 派发 |
+| `login()` | `:194-221` | POST /v1/auth/login,返回 access_token |
+| `ensureToken()` | `:179-191` | 首次调用自动登录,后续复用 token |
+| `doJSON()` | `:223-249` | 通用 JSON 请求,返回 `(body, statusCode)` |
+| `doSSE()` | `:252-294` | SSE 流式请求,按 `event:` / `data:` 行解析打印 |
+| `doUpload()` | `:297-340` | multipart 文件上传 |
+| `printResp()` | `:343-353` | 响应打印,支持 `-json` 美化 |
+| `cmdFlags()` | `:361-369` | 子命令 FlagSet 工厂 |
+
+**命令清单(59 个)**:
+
+| # | 命令 | 接口 | 功能域 |
+|---|---|---|---|
+| 1 | `login` | POST /v1/auth/login | 鉴权 |
+| 2 | `self` | GET /v1/self | 鉴权 |
+| 3 | `llm-test` | POST /v1/integrations/llm/test | LLM 配置 |
+| 4 | `llm-save` | POST /v1/integrations/llm/validate-and-save | LLM 配置 |
+| 5 | `llm-invalidate` | POST /v1/integrations/llm/invalidate | LLM 配置 |
+| 6 | `llm-settings` | GET /v1/system-settings?category=llm | LLM 配置 |
+| 7 | `llm-setting` | PUT /v1/system-settings/llm/{key} | LLM 配置 |
+| 8 | `models` | GET /v1/aiops/models | 模型目录 |
+| 9 | `usage` | GET /v1/usage/today | 用量 |
+| 10 | `session-create` | POST /v1/chat/sessions | 会话 |
+| 11 | `session-list` | GET /v1/chat/sessions | 会话 |
+| 12 | `session-rename` | PATCH /v1/chat/sessions/{id} | 会话 |
+| 13 | `session-close` | DELETE /v1/chat/sessions/{id} | 会话 |
+| 14 | `chat` | POST /v1/chat/sessions/{id}/messages | 消息(同步) |
+| 15 | `chat-stream` | POST /v1/chat/sessions/{id}/messages/stream | 消息(SSE) |
+| 16 | `chat-stop` | POST /v1/chat/sessions/{id}/stop | 消息(中断) |
+| 17 | `messages` | GET /v1/chat/sessions/{id}/messages | 消息(历史) |
+| 18 | `translate` | POST /v1/aiops/query-translate | 查询翻译 |
+| 19 | `agent-list` | GET /v1/agents | Agent |
+| 20 | `agent-get` | GET /v1/agents/{name} | Agent |
+| 21 | `agent-create` | POST /v1/agents/custom | Agent |
+| 22 | `agent-update` | PATCH /v1/agents/custom/{name} | Agent |
+| 23 | `agent-delete` | DELETE /v1/agents/custom/{name} | Agent |
+| 24 | `skill-list` | GET /v1/skills | Skill |
+| 25 | `skill-get` | GET /v1/skills/{key} | Skill |
+| 26 | `skill-exec` | POST /v1/skills/{key}/execute | Skill |
+| 27 | `doc-list` | GET /v1/knowledge/docs | 知识库 |
+| 28 | `doc-get` | GET /v1/knowledge/docs/{id} | 知识库 |
+| 29 | `doc-create` | POST /v1/knowledge/docs | 知识库 |
+| 30 | `doc-update` | PATCH /v1/knowledge/docs/{id} | 知识库 |
+| 31 | `doc-delete` | DELETE /v1/knowledge/docs/{id} | 知识库 |
+| 32 | `doc-upload` | POST /v1/knowledge/upload | 知识库(multipart) |
+| 33 | `doc-move` | PATCH /v1/knowledge/docs/{id}/move | 知识库 |
+| 34 | `kn-search` | GET /v1/knowledge/search | 知识库(向量搜索) |
+| 35 | `kn-paths` | GET /v1/knowledge/paths | 知识库 |
+| 36 | `repo-list` | GET /v1/knowledge/repos | Git 仓库 |
+| 37 | `repo-create` | POST /v1/knowledge/repos | Git 仓库 |
+| 38 | `repo-sync` | POST /v1/knowledge/repos/{id}/sync | Git 仓库 |
+| 39 | `repo-delete` | DELETE /v1/knowledge/repos/{id} | Git 仓库 |
+| 40 | `vault-sync` | POST /v1/knowledge/vault/sync | Vault |
+| 41 | `mcp-list` | GET /v1/mcp/servers | MCP |
+| 42 | `mcp-get` | GET /v1/mcp/servers/{id} | MCP |
+| 43 | `mcp-create` | POST /v1/mcp/servers | MCP |
+| 44 | `mcp-update` | PUT /v1/mcp/servers/{id} | MCP |
+| 45 | `mcp-delete` | DELETE /v1/mcp/servers/{id} | MCP |
+| 46 | `mcp-test` | POST /v1/mcp/servers/{id}/test | MCP(探针) |
+| 47 | `approval-list` | GET /v1/approvals | Approval |
+| 48 | `approval-count` | GET /v1/approvals/count | Approval |
+| 49 | `approval-get` | GET /v1/approvals/{id} | Approval |
+| 50 | `approve` | POST /v1/approvals/{id}/approve | Approval |
+| 51 | `reject` | POST /v1/approvals/{id}/reject | Approval |
+| 52 | `proposals` | GET /v1/aiops/mutating-proposals | Proposal 审计 |
+| 53 | `mentions` | GET /v1/aiops/mentions/search | Mention |
+| 54 | `investigate` | POST /v1/alerts/incidents/{id}/investigation | Alert RCA |
+| 55 | `investigation` | GET /v1/alerts/incidents/{id}/investigation | Alert RCA |
+| 56 | `report-gen` | POST /v1/reports | Report |
+| 57 | `report-schedules` | GET /v1/report-schedules | Report |
+| 58 | `ask` | 组合(session+chat+close) | 便捷问答 |
+| 59 | `ask-stream` | 组合(session+stream+close) | 便捷问答(SSE) |
+| 60 | `smoke` | 组合(21 个零依赖接口) | 端到端冒烟 |
+
+### 13.2 `cmd/llm/llm_test.md`(本文件)
+
+完整测试方案文档,12 节 + 本附录:
+1. 测试目标(58 命令 / 59 接口覆盖矩阵)
+2. 环境前置(工具链 / ongrid 服务 / LLM provider 配置)
+3. 构建客户端
+4. 全局参数
+5. 测试用例(60+ 用例,分 17 个功能域)
+6. 端到端 happy path
+7. 错误场景汇总(12 项)
+8. 清理流程
+9. 测试覆盖矩阵(60 行表格)
+10. 自动化集成(CI / 定期回归)
+11. 已知限制(7 项)
+12. 验证清单
+13. 交付物清单(本节)
+
+### 13.3 构建验证
+
+```bash
+$ GOPROXY=https://goproxy.cn GOTOOLCHAIN=go1.25.0 go build -o bin/llm ./cmd/llm/ && echo "BUILD OK"
+BUILD OK
+
+$ GOPROXY=https://goproxy.cn GOTOOLCHAIN=go1.25.0 go vet ./cmd/llm/ && echo "VET OK"
+VET OK
+
+$ ./bin/llm -v
+llm dev
+
+$ ./bin/llm --help | head -10
+llm dev — ongrid LLM API test client
+
+Usage: llm [flags] <command> [args]
+
+Flags:
+  -addr string
+    	ongrid base URL (default "http://localhost:8080")
+  ...
+```
+
+### 13.4 关键设计决策
+
+| 决策 | 理由 |
+|---|---|
+| 纯标准库实现 | 零外部依赖,构建产物单文件可执行,便于分发到任意机器测试 |
+| 子命令式 CLI | 每个接口一个命令,命令名即接口路径,易记易补全 |
+| 自动登录 + token 复用 | 首个命令触发登录,后续命令复用进程内 token;跨进程用 `-token` 传入 |
+| `doJSON` / `doSSE` / `doUpload` 三层抽象 | 覆盖 ongrid 三类 HTTP 接口形态:JSON / SSE 流式 / multipart 上传 |
+| `smoke` 一键冒烟 | 21 个零依赖接口自动跑通,适合 CI;依赖外部(edge / git / MCP server / incident)的用例手动跑 |
+| `ask` / `ask-stream` 便捷命令 | 串联 session-create → chat → close,适合快速验证 LLM 调用链 |
+| 不新增服务端接口 | 严格遵循"只使用当前 ongrid 提供的接口"约束,所有命令调用已注册路由 |
+| 间接测试不可直测接口 | embedding 无 HTTP 接口 → 通过 `doc-create` + `kn-search` 间接验证;aiops 内部工具 → 通过 `chat` 引导 LLM 调用,从 `tool_calls` 观察 |
+
+### 13.5 文件清单
+
+```
+cmd/llm/
+├── main.go       # 1475 行,测试客户端源码
+└── llm_test.md   # 本文件,完整测试方案
+```
+
+### 13.6 验证状态
+
+| 项 | 状态 |
+|---|---|
+| `go build ./cmd/llm/` | ✅ 通过 |
+| `go vet ./cmd/llm/` | ✅ 通过 |
+| `./bin/llm -v` | ✅ 输出 `llm dev` |
+| `./bin/llm --help` | ✅ 打印 60 条命令清单 |
+| 单元测试 | — (测试客户端本身无单测,通过 `smoke` 命令做集成验证) |
+| 端到端冒烟 | 待 ongrid 服务运行后执行 `./bin/llm smoke` 验证 |
+
